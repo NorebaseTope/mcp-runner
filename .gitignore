@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.npmrc
+*.log
+.DS_Store
+.sync-deps-hash.json

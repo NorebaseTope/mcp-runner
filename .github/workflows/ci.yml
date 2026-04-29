@@ -1,0 +1,56 @@
+name: CI
+
+# Typecheck + test + build on every push and PR. Mirrors the gates the
+# release workflow runs before publishing, so a regression here means the
+# release would also fail.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke-test built binary
+        run: |
+          set -euo pipefail
+          test -f dist/cli.js
+          head -1 dist/cli.js | grep -q '^#!/usr/bin/env node'
+          actual="$(node dist/cli.js --version | tr -d '[:space:]')"
+          expected="$(node -p "require('./package.json').version")"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::built runner reports version '$actual' but package.json is '$expected'"
+            exit 1
+          fi
+          node dist/cli.js help >/dev/null

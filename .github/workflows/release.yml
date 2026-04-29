@@ -1,0 +1,257 @@
+name: Release @prepsavant/mcp
+
+# Release pipeline for the public Sam runner repo.
+#
+# TRIGGERS
+# --------
+# 1. Push to main that touches package.json (intent: a version bump merged
+#    in a PR). The job reads the version from package.json, checks whether
+#    that version is already on npm, and exits cleanly if so. This makes
+#    documentation / CI / src-only changes safe to merge.
+#
+# 2. Manual "Run workflow" dispatch (fallback for re-releasing or dry-run).
+#
+# WHAT THE JOB DOES
+# -----------------
+#   1. (workflow_dispatch only) Bumps package.json to the requested version.
+#   2. Reads the version from package.json.
+#   3. (push trigger) Exits cleanly if that version is already on npm.
+#   4. Typechecks + tests + builds.
+#   5. Smoke-tests the bundled CLI binary.
+#   6. Generates a CycloneDX SBOM.
+#   7. `npm publish --provenance`. Because this repo is *public*, npm will
+#      verify the Sigstore attestation and `npm audit signatures` will
+#      report verified provenance.
+#   8. (push) Pushes the v${VERSION} tag.
+#      (workflow_dispatch) Commits the bump and pushes the tag.
+#   9. Creates a matching GitHub Release with the SBOM attached.
+#
+# Required secrets:
+#   NPM_TOKEN  - Granular or Classic Automation token with publish access to
+#                the @prepsavant scope.
+#
+# Required permissions (declared on the job):
+#   contents: write   - push the bump commit + tag, create the GitHub Release.
+#   id-token: write   - mint the OIDC token npm uses to sign the provenance
+#                       attestation. Without this, `npm publish --provenance`
+#                       fails with "Missing OIDC ID token".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact semver to release (e.g. 0.4.2). Mutually exclusive with bump."
+        required: false
+        type: string
+      bump:
+        description: "Bump kind (used when 'version' is empty)."
+        required: false
+        type: choice
+        default: "patch"
+        options:
+          - patch
+          - minor
+          - major
+          - prerelease
+      preid:
+        description: "Prerelease identifier (only used when bump=prerelease)."
+        required: false
+        default: "rc"
+      dry_run:
+        description: "If true, run `npm publish --dry-run` without publishing or pushing the tag."
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Bump, build, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+          scope: "@prepsavant"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bump version (workflow_dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          INPUT_PREID: ${{ inputs.preid }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            npm version "$INPUT_VERSION" --no-git-tag-version --allow-same-version=false
+          else
+            if [ "$INPUT_BUMP" = "prerelease" ]; then
+              npm version prerelease --preid "$INPUT_PREID" --no-git-tag-version
+            else
+              npm version "$INPUT_BUMP" --no-git-tag-version
+            fi
+          fi
+
+      - name: Read released version
+        id: version
+        run: |
+          set -euo pipefail
+          v=$(node -p "require('./package.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Releasing @prepsavant/mcp@$v"
+
+      - name: Compute dist-tag
+        id: dist_tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if echo "$VERSION" | grep -q '-'; then
+            tag="next"
+          else
+            tag="latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check if version already published (push trigger only)
+        id: guard
+        if: ${{ github.event_name == 'push' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "@prepsavant/mcp@${VERSION}" version --json 2>/dev/null | grep -q '"'; then
+            echo "::notice::@prepsavant/mcp@${VERSION} is already on npm — skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Typecheck
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        run: npm run typecheck
+
+      - name: Test
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        run: npm test
+
+      - name: Build
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        run: npm run build
+
+      - name: Smoke-test built binary
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        run: |
+          set -euo pipefail
+          test -f dist/cli.js
+          head -1 dist/cli.js | grep -q '^#!/usr/bin/env node'
+          actual="$(node dist/cli.js --version | tr -d '[:space:]')"
+          expected="${{ steps.version.outputs.version }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::built runner reports version '$actual' but package.json is '$expected'"
+            exit 1
+          fi
+          node dist/cli.js help >/dev/null
+
+      - name: Inspect publish tarball
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        run: npm pack --dry-run
+
+      - name: Generate SBOM (CycloneDX)
+        id: sbom
+        if: ${{ github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true' }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: prepsavant-mcp-${{ steps.version.outputs.version }}.cdx.json
+          output-file: ${{ runner.temp }}/prepsavant-mcp-${{ steps.version.outputs.version }}.cdx.json
+          upload-artifact: true
+
+      - name: Publish to npm (dry run)
+        if: ${{ inputs.dry_run && (github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true') }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ steps.dist_tag.outputs.tag }}
+        run: npm publish --provenance --access public --tag "$NPM_DIST_TAG" --dry-run
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run && (github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true') }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ steps.dist_tag.outputs.tag }}
+        run: npm publish --provenance --access public --tag "$NPM_DIST_TAG"
+
+      - name: Verify dist-tag after publish
+        if: ${{ !inputs.dry_run && (github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true') }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NPM_DIST_TAG: ${{ steps.dist_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dist_tag_output=$(npm dist-tag ls @prepsavant/mcp)
+          echo "$dist_tag_output"
+          actual=$(echo "$dist_tag_output" | grep "^${NPM_DIST_TAG}:" | awk '{print $2}')
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error::dist-tag '${NPM_DIST_TAG}' points to '$actual', expected '$VERSION'"
+            exit 1
+          fi
+
+      - name: Commit bump and push tag
+        if: ${{ !inputs.dry_run && (github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true') }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "v$VERSION"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            git add package.json
+            git commit -m "release: v$VERSION"
+            git push
+          fi
+          git push origin "refs/tags/v$VERSION"
+
+      - name: Create GitHub Release with SBOM
+        if: ${{ !inputs.dry_run && (github.event_name == 'workflow_dispatch' || steps.guard.outputs.should_publish == 'true') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: "@prepsavant/mcp v${{ steps.version.outputs.version }}"
+          fail_on_unmatched_files: true
+          files: ${{ runner.temp }}/prepsavant-mcp-${{ steps.version.outputs.version }}.cdx.json
+          body: |
+            `@prepsavant/mcp` — release ${{ steps.version.outputs.version }}.
+
+            - npm: https://www.npmjs.com/package/@prepsavant/mcp/v/${{ steps.version.outputs.version }}
+            - Built by GitHub Actions
+              run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            - SBOM (CycloneDX): attached as
+              `prepsavant-mcp-${{ steps.version.outputs.version }}.cdx.json`.
+            - npm provenance: enabled (verify with `npm audit signatures`).

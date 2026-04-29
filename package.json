@@ -1,0 +1,46 @@
+{
+  "name": "@prepsavant/mcp",
+  "version": "0.4.0",
+  "description": "Local Sam MCP runner — pinned-test sandbox grading and MCP-sampling persona for the Sam interview-prep coach.",
+  "license": "MIT",
+  "homepage": "https://github.com/NorebaseTope/mcp-runner",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NorebaseTope/mcp-runner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NorebaseTope/mcp-runner/issues"
+  },
+  "bin": {
+    "prepsavant": "dist/cli.js"
+  },
+  "type": "module",
+  "main": "dist/cli.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.18"
+  },
+  "scripts": {
+    "build": "node ./build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/__tests__/*.test.ts",
+    "doctor": "node dist/cli.js doctor"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "esbuild": "^0.27.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
