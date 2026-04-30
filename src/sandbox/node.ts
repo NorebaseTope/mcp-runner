@@ -54,9 +54,16 @@ function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 const HARNESS_JS = `
-import("./solution.js")
+import("./%SOLUTION_FILE%")
   .then((mod) => {
-    const fn = mod["%ENTRY%"] ?? mod.default;
+    // Resolve the entry function. Order:
+    //   1. named ESM export: \`export function solve\`
+    //   2. named on the CJS module.exports object surfaced via mod.default:
+    //      \`module.exports = { solve }\`
+    //   3. ESM default export, or \`module.exports = function ...\`
+    const fn = mod["%ENTRY%"]
+      ?? (mod.default && mod.default["%ENTRY%"])
+      ?? mod.default;
     if (typeof fn !== "function") {
       console.log(JSON.stringify({ kind: "import_error", stderr: "Entry symbol \\"%ENTRY%\\" is not a function (got " + typeof fn + ")." }));
       return;
@@ -83,8 +90,16 @@ import("./solution.js")
 `;
 
 const HARNESS_TS = `
-import * as mod from "./solution.ts";
-const fn: any = (mod as any)["%ENTRY%"] ?? (mod as any).default;
+import * as mod from "./%SOLUTION_FILE%";
+// Resolve the entry function. Order mirrors the JS harness:
+//   1. named ESM export: \`export function solve\`
+//   2. named on the CJS module.exports object surfaced via mod.default:
+//      \`export = { solve }\` or \`module.exports = { solve }\` in a .cts file
+//   3. ESM default export, or \`module.exports = function ...\`
+const _m: any = mod as any;
+const fn: any = _m["%ENTRY%"]
+  ?? (_m.default && _m.default["%ENTRY%"])
+  ?? _m.default;
 ${deepEqual.toString()}
 async function main() {
   if (typeof fn !== "function") {
@@ -198,6 +213,30 @@ function parseHarnessOutput(
   };
 }
 
+// Best-effort detector for CommonJS-style solutions. The sandbox writes a
+// `package.json` with `"type": "module"`, so a body that uses `module.exports`
+// or top-level `require()` would otherwise fail with the misleading
+// `ReferenceError: module is not defined in ES module scope`. When the body
+// looks unambiguously CommonJS (and lacks ESM markers), we mirror it to a
+// `.cjs` file so Node treats it as CommonJS regardless of the surrounding
+// `package.json`. Anything that uses `import`/`export` keeps the ESM treatment.
+export function looksLikeCommonJS(code: string): boolean {
+  // Strip block + line comments so commented-out hints don't fool the heuristic.
+  const stripped = code
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+  const hasCjs =
+    /\bmodule\.exports\b/.test(stripped) ||
+    /\bexports\.\w+\s*=/.test(stripped) ||
+    /(^|[^.\w])require\s*\(/.test(stripped);
+  if (!hasCjs) return false;
+  const hasEsm =
+    /^\s*export\s+(?:default\s+|\{|const\b|let\b|var\b|function\b|class\b|async\b|type\b|interface\b|enum\b|\*)/m.test(stripped) ||
+    /^\s*import\s+[\s\S]+?from\s+['"]/m.test(stripped) ||
+    /^\s*import\s*['"]/m.test(stripped);
+  return !hasEsm;
+}
+
 export function runJavascriptSandbox(
   code: string,
   entry: string,
@@ -207,10 +246,17 @@ export function runJavascriptSandbox(
   ensureConfigDir();
   const dir = fs.mkdtempSync(path.join(SANDBOX_DIR, "js-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ type: "module" }));
-  fs.writeFileSync(path.join(dir, "solution.js"), code, { mode: 0o600 });
+  // Pick the extension that matches the solution body. The `.mjs`/`.cjs`
+  // extensions force Node into the matching module mode regardless of the
+  // surrounding `package.json`, so authors can use either style without a
+  // `ReferenceError: module is not defined` (or the inverse for `import`).
+  const solutionFile = looksLikeCommonJS(code) ? "solution.cjs" : "solution.mjs";
+  fs.writeFileSync(path.join(dir, solutionFile), code, { mode: 0o600 });
   fs.writeFileSync(
     path.join(dir, "harness.mjs"),
-    HARNESS_JS.replace(/%ENTRY%/g, entry),
+    HARNESS_JS
+      .replace(/%ENTRY%/g, entry)
+      .replace(/%SOLUTION_FILE%/g, solutionFile),
     { mode: 0o600 },
   );
   const t0 = Date.now();
@@ -262,13 +308,37 @@ export function runTypescriptSandbox(
   ensureConfigDir();
   const dir = fs.mkdtempSync(path.join(SANDBOX_DIR, "ts-"));
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ type: "module" }));
-  fs.writeFileSync(path.join(dir, "solution.ts"), code, { mode: 0o600 });
+  // Mirror the JS path: pick `.cts` for unambiguous CommonJS bodies (the
+  // `looksLikeCommonJS` heuristic flags top-level `module.exports`,
+  // `exports.foo =`, and `require(...)` calls). That avoids the misleading
+  // `ReferenceError: module is not defined in ES module scope` from the
+  // surrounding `"type": "module"` package.json on older tsx/Node combos,
+  // and keeps the file unambiguously CJS for tsx's resolver.
+  //
+  // Pure `export = { solve }` bodies are *not* matched by the heuristic —
+  // they have no `module.exports`/`require` token — and intentionally stay
+  // on the `.ts` path. tsx still transpiles them to a CJS-shaped module
+  // surfaced as `mod.default`, which the harness's entry-symbol fallback
+  // (`mod.default[entry]`) below picks up.
+  const solutionFile = looksLikeCommonJS(code) ? "solution.cts" : "solution.ts";
+  fs.writeFileSync(path.join(dir, solutionFile), code, { mode: 0o600 });
   fs.writeFileSync(
     path.join(dir, "harness.ts"),
-    HARNESS_TS.replace(/%ENTRY%/g, entry),
+    HARNESS_TS
+      .replace(/%ENTRY%/g, entry)
+      .replace(/%SOLUTION_FILE%/g, solutionFile),
     { mode: 0o600 },
   );
   const t0 = Date.now();
+  // npx's NixOS wrapper requires HOME/XDG_CONFIG_HOME to be set (it runs
+  // under `set -u`), and tsx itself needs HOME for its on-disk module
+  // resolution cache. Forward only those well-known config/cache markers
+  // so the sandbox stays lean while still being launchable on Replit.
+  const npxEnv: Record<string, string> = { PATH: process.env.PATH ?? "" };
+  for (const k of ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TMPDIR"]) {
+    const v = process.env[k];
+    if (v) npxEnv[k] = v;
+  }
   const proc = spawnSync(
     "npx",
     ["-y", "tsx", "harness.ts", JSON.stringify(cases)],
@@ -276,7 +346,7 @@ export function runTypescriptSandbox(
       cwd: dir,
       timeout: timeoutMs,
       encoding: "utf-8",
-      env: { PATH: process.env.PATH ?? "" },
+      env: npxEnv,
     },
   );
   const durationMs = Date.now() - t0;
