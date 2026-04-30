@@ -416,14 +416,14 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
   ];
   if (opts.plan !== undefined) {
     const planLabel =
-      opts.plan === "lifetime" ? "Lifetime" : opts.plan === "pro" ? "Pro" : "Free";
+      opts.plan === "lifetime" ? "$299 plan" : opts.plan === "pro" ? "Pro" : "Free";
     const planStatus: DoctorCheckStatus = opts.plan === "free" ? "warn" : "pass";
     license.push({
       id: "license.plan",
       label: "Plan",
       status: planStatus,
       detail: opts.plan === "free"
-        ? `Free — AI-Assisted sessions require Pro or Lifetime. Upgrade at: ${upgradeUrl}`
+        ? `Free — AI-Assisted sessions need the $299 plan ("until you're hired"). Upgrade at: ${upgradeUrl}`
         : `PrepSavant ${planLabel} — AI-Assisted sessions available`,
       fixCommand: opts.plan === "free" ? upgradeUrl : undefined,
     });
@@ -541,7 +541,7 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
   let aiAssistedHintKind: DoctorHintKind | undefined;
   if (opts.plan === "free") {
     aiAssistedStatus = "warn";
-    aiAssistedDetail = `Free plan — AI-Assisted requires Pro or Lifetime. Upgrade at: ${upgradeUrl}`;
+    aiAssistedDetail = `Free plan — AI-Assisted needs the $299 plan ("until you're hired"). Upgrade at: ${upgradeUrl}`;
     aiAssistedFix = upgradeUrl;
     aiAssistedHintKind = "upgrade-plan";
   } else if (!hookCapableHostsInstalled) {

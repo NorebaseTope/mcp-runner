@@ -208,24 +208,26 @@ export function tryAutoCleanupStaleHooks(
   };
 }
 
-// Build the user-facing "AI-Assisted requires Pro" message. `apiBaseUrl`
-// is used as the origin for the upgrade URL so dev/staging environments
-// surface their own pricing page rather than always pointing at production.
+// Build the user-facing "AI-Assisted requires the $299 plan" message.
+// `apiBaseUrl` is used as the origin for the upgrade URL so dev/staging
+// environments surface their own pricing page rather than always pointing at
+// production. The message intentionally drops the legacy "Pro/Lifetime" tier
+// labels in favor of the "$299 — until you're hired" framing used on the
+// dashboard and in `doctor`. The `body` argument is still accepted (and the
+// internal `requiredEntitlement` value still flows through so logic elsewhere
+// keeps working) but no longer changes the rendered copy.
 // Exported for unit testing.
 export function formatEntitlementRequiredMessage(
   apiBaseUrl: string,
-  body: EntitlementRequiredErrorBody,
+  _body: EntitlementRequiredErrorBody,
 ): string {
   const upgradeUrl = `${apiBaseUrl.replace(/\/$/, "")}/pricing`;
-  const required = body.requiredEntitlement ?? "pro";
-  const tierLabel =
-    required === "lifetime" ? "Lifetime" : "Pro";
   const lines = [
     ``,
-    `  AI-Assisted requires PrepSavant ${tierLabel}`,
+    `  AI-Assisted requires the PrepSavant $299 plan`,
     `  ─────────────────────────────────────────────`,
     ``,
-    `  AI-Assisted sessions need a PrepSavant Pro or Lifetime plan.`,
+    `  AI-Assisted sessions need the $299 plan ("until you're hired").`,
     `  Upgrade at: ${upgradeUrl}`,
     ``,
   ];
@@ -985,15 +987,17 @@ export async function runStart(flags: Record<string, string | boolean>): Promise
   } catch (err) {
     if (isEntitlementRequiredError(err)) {
       if (jsonMode) {
-        // Collapse the multi-line "AI-Assisted requires Pro" message into a
-        // single-line JSON error so scripts can parse it the same way they
-        // parse other --json failures. Include the upgrade URL inline so
-        // CI integrations don't lose the actionable hint.
+        // Collapse the multi-line "AI-Assisted requires the $299 plan"
+        // message into a single-line JSON error so scripts can parse it the
+        // same way they parse other --json failures. Include the upgrade URL
+        // inline so CI integrations don't lose the actionable hint. The copy
+        // intentionally drops the legacy Pro/Lifetime tier labels and matches
+        // the "$299 — until you're hired" framing used by `doctor` and the
+        // dashboard.
         const upgradeUrl = `${cfg.apiBaseUrl.replace(/\/$/, "")}/pricing`;
-        const tier = err.body.requiredEntitlement === "lifetime" ? "Lifetime" : "Pro";
         process.stderr.write(
           formatStartErrorJson(
-            `AI-Assisted requires PrepSavant ${tier}. Upgrade at: ${upgradeUrl}`,
+            `AI-Assisted requires the PrepSavant $299 plan ("until you're hired"). Upgrade at: ${upgradeUrl}`,
           ),
         );
       } else {
