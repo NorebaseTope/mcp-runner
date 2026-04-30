@@ -736,7 +736,21 @@ test("runStart --json: stale hook marker is auto-removed without prompting", () 
   try {
     const result = spawnSync(
       TSX_BIN,
-      [CLI_SRC, "start", "--json", "--tool", "definitely-not-a-real-tool"],
+      [
+        CLI_SRC,
+        "start",
+        // Stale-hook detection + auto-cleanup lives on the AI-Assisted
+        // start path (`ai-assisted/cli-start.ts`). After Coached became
+        // the default `start` mode (Task #525), this test has to opt
+        // into the AI-Assisted branch explicitly — otherwise `start`
+        // dispatches into Coached, which prints help text and exits 0
+        // without ever running the stale-hook check or validating
+        // `--tool`.
+        "--ai-assisted",
+        "--json",
+        "--tool",
+        "definitely-not-a-real-tool",
+      ],
       {
         env: {
           ...process.env,

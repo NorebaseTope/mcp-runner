@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Entry point for the `prepsavant` bin. Subcommands:
-//   prepsavant install [--host claude|cursor|codex] [--dry-run]
+//   prepsavant install [--host claude|claude_code|cursor|codex] [--dry-run]
 //   prepsavant auth [--no-browser] [--api-base <url>]
 //   prepsavant doctor [--json]
 //   prepsavant mcp        (default — runs the MCP server on stdio)
@@ -53,24 +53,30 @@ function parseArgs(argv: string[]): ParsedArgs {
 const HELP = `prepsavant ${ADAPTER_VERSION}
 
 Usage:
-  prepsavant start   [--ai-assisted]  Start an AI-Assisted capture session
+  prepsavant start   [--mode coached|ai-assisted]
+                                      Start a session. Defaults to coached if --mode is omitted.
+                    [--ai-assisted]   Alias for --mode ai-assisted (backwards-compat)
                     [--json]          Print {sessionId,tool,startedAt} JSON to stdout on success;
                                       {"error":"..."} to stderr on failure (for scripts/CI)
-                    [--tool <id>]     Pre-select tool (claude_code|cursor|codex_cli) and skip the picker
-                    [--codex-mode <m>] Pre-select Codex capture mode (interactive|exec); only used with --tool codex_cli
-                    [--codex-prompt <p>] Pre-supply the Codex exec prompt (text or @file accepted by codex);
-                                      required in --json mode with --tool codex_cli --codex-mode exec,
-                                      otherwise the run would hang on the interactive prompt-for-Codex question
-                    [--question-id <id>] Pre-select the problem by id and skip the problem picker
-                    [--accept-consent] Auto-accept the session consent dialog (for unattended runs)
+                    [--tool <id>]     (ai-assisted only) Pre-select tool (claude_code|cursor|codex_cli)
+                    [--codex-mode <m>] Pre-select Codex capture mode (interactive|exec)
+                    [--codex-prompt <p>] Pre-supply the Codex exec prompt
+                    [--question-id <id>] Pre-select the problem by id
+                    [--accept-consent] Auto-accept the session consent dialog
                     [--cleanup-stale-hooks] Auto-remove stale hooks from a prior crashed session
-                                      without prompting (implied by --json; use this flag in
-                                      non-JSON unattended runs)
   prepsavant status  [<session-id>]   Show hook channels, events, and integrity for a live session
                     [--watch] [-w]    (defaults to the most recent active session in this workspace)
                     [--interval <s>]  Re-render every <s> seconds in --watch mode (default 5, min 1)
                     [--json]          Print the full status payload as JSON to stdout (one-shot only)
-  prepsavant install [--host claude|cursor|codex] [--dry-run]
+  prepsavant study   [--question <id>]   Open Study chat with Sam scoped to a problem.
+                                          Runs in your IDE chat via MCP study_* tools.
+                    [--post-session <sessionId>]
+                                          Post-session reflection chat for a finished session.
+                                          Requires --question with the same questionId.
+                    [--json]              JSON preflight: creates the conversation server-side
+                                          and prints {conversationId,mode,questionId,startedAt}.
+                                          (No sessions/attempts/hints are ever written.)
+  prepsavant install [--host claude|claude_code|cursor|codex] [--dry-run]
   prepsavant auth    [--no-browser] [--api-base <url>]
   prepsavant doctor  [--json]
   prepsavant mcp     (default — runs the MCP server on stdio)
@@ -90,6 +96,12 @@ async function main(): Promise<void> {
   }
 
   if (command === "start") {
+    const mode = (flags.mode as string | undefined) ?? (flags["ai-assisted"] ? "ai-assisted" : "coached");
+    if (mode === "coached") {
+      const { runCoachedStart } = await import("./coached/cli-start.js");
+      await runCoachedStart(flags);
+      return;
+    }
     const { runStart } = await import("./ai-assisted/cli-start.js");
     await runStart(flags);
     return;
@@ -98,6 +110,12 @@ async function main(): Promise<void> {
   if (command === "status") {
     const { runStatus } = await import("./ai-assisted/cli-status.js");
     await runStatus(positional, flags);
+    return;
+  }
+
+  if (command === "study") {
+    const { runStudyStart } = await import("./study/cli-start.js");
+    await runStudyStart(flags);
     return;
   }
 

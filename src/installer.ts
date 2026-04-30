@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export type HostId = "claude" | "cursor" | "codex";
+export type HostId = "claude" | "claude_code" | "cursor" | "codex";
 
 export interface HostTarget {
   id: HostId;
@@ -31,6 +31,17 @@ function claudeDesktopConfigPath(): string | null {
   return home(".config", "Claude", "claude_desktop_config.json");
 }
 
+function claudeCodeConfigPath(): string | null {
+  // Claude Code (the CLI) writes its user-level config to ~/.claude.json on
+  // first launch, regardless of OS. The file holds OAuth state, project
+  // history, and per-project mcpServers. Existence of this file is the most
+  // reliable signal that Claude Code is installed and has been run at least
+  // once. Note: this is distinct from Claude Desktop's config (which lives
+  // under the platform-specific Application Support directory) — they share
+  // a brand but not a config surface.
+  return home(".claude.json");
+}
+
 function cursorConfigPath(): string | null {
   // Cursor 0.45+ supports a global mcp.json under the user config directory.
   // Older Cursor versions only allow MCP via Settings UI; we fall back to a
@@ -52,6 +63,7 @@ function codexConfigPath(): string | null {
 export function detectHosts(): HostTarget[] {
   const items: Array<{ id: HostId; label: string; configPath: string | null }> = [
     { id: "claude", label: "Claude Desktop", configPath: claudeDesktopConfigPath() },
+    { id: "claude_code", label: "Claude Code", configPath: claudeCodeConfigPath() },
     { id: "cursor", label: "Cursor", configPath: cursorConfigPath() },
     { id: "codex", label: "Codex", configPath: codexConfigPath() },
   ];
@@ -122,12 +134,24 @@ command = "npx"
 args = ["-y", "${pkg}"]
 `;
 
+// Claude Code uses the `claude mcp add` CLI rather than direct edits to
+// ~/.claude.json (its mcpServers live under projects.<path>.mcpServers, so
+// patching the top-level mcpServers key would not actually register sam).
+// We print the canonical command so the user can run it themselves.
+const CLAUDE_CODE_MANUAL_SNIPPET = (pkg: string) => `
+Run the following to register sam with Claude Code:
+
+claude mcp add sam npx -y ${pkg}
+`;
+
 export function install(opts: InstallOptions = {}): InstallResult[] {
   const pkg = opts.packageSpec ?? DEFAULT_PACKAGE_SPEC;
   const all = detectHosts();
   const targets = opts.host ? all.filter((t) => t.id === opts.host) : all;
   if (opts.host && targets.length === 0) {
-    throw new Error(`Unknown host "${opts.host}". Use one of: claude, cursor, codex.`);
+    throw new Error(
+      `Unknown host "${opts.host}". Use one of: claude, claude_code, cursor, codex.`,
+    );
   }
 
   const results: InstallResult[] = [];
@@ -139,6 +163,18 @@ export function install(opts: InstallOptions = {}): InstallResult[] {
         status: "manual",
         configPath: t.configPath,
         message: CODEX_MANUAL_SNIPPET(pkg).trim(),
+      });
+      continue;
+    }
+    if (t.id === "claude_code") {
+      // Claude Code's mcpServers live under projects.<path>.mcpServers in
+      // ~/.claude.json; the supported install path is `claude mcp add`. We
+      // print the snippet rather than risk clobbering the user's config.
+      results.push({
+        host: t.id,
+        status: "manual",
+        configPath: t.configPath,
+        message: CLAUDE_CODE_MANUAL_SNIPPET(pkg).trim(),
       });
       continue;
     }
