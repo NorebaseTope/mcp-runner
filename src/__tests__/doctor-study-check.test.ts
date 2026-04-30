@@ -53,6 +53,10 @@ test("manifest.study_mode is warn when device token is missing", () => {
   assert.equal(study!.status, "warn");
   assert.match(study!.detail ?? "", /prepsavant auth/);
   assert.equal(study!.fixCommand, "prepsavant auth");
+  // task-595: the typed hintKind classifier must accompany every warn-state
+  // quickstart check so renderers can pick the right affordance without
+  // sniffing the free-form detail copy.
+  assert.equal(study!.hintKind, "auth");
 
   // formatDoctor should surface a quickstart Study tile in its preamble
   // (above [host]) with the warn symbol and an actionable auth hint.
@@ -80,6 +84,8 @@ test("manifest.study_mode is warn when token exists but no host is installed", (
   assert.equal(study!.fixCommand, undefined);
   // Detail should mention the host install gap.
   assert.match(study!.detail ?? "", /AI chat host/);
+  // task-595: the typed classifier must reflect the gap (no host installed).
+  assert.equal(study!.hintKind, "install-host");
 
   // Quickstart tile should now point users at `prepsavant install --host
   // cursor` so the next step is unambiguous.
@@ -126,6 +132,9 @@ test("manifest.study_mode is pass when token is present AND a host is installed"
   );
   assert.match(study!.detail ?? "", /MCP study_\* tools are reachable/);
   assert.equal(study!.fixCommand, undefined);
+  // Pass-state checks should NOT carry a hintKind — the renderers only
+  // consult it for warn-state quickstart tiles.
+  assert.equal(study!.hintKind, undefined);
 
   // The pass-state tile uses the ✓ symbol and tells the user the in-IDE
   // command is ready to run.
@@ -182,6 +191,7 @@ test("Coached tile warns with install hint when no host is installed", () => {
   assert.ok(coached);
   assert.equal(coached!.status, "warn");
   assert.match(coached!.detail ?? "", /AI chat host/);
+  assert.equal(coached!.hintKind, "install-host");
 
   const tile = findTileLine(formatDoctor(result), "Coached mode");
   assert.ok(tile, "formatDoctor should render a Coached mode tile");
@@ -201,6 +211,7 @@ test("AI-Assisted tile warns and surfaces the upgrade URL on the Free plan", () 
   // The upgrade URL should be the same one license.plan exposes so the
   // user only has to click one link.
   assert.equal(ai!.fixCommand, "https://prepsavant.com/pricing");
+  assert.equal(ai!.hintKind, "upgrade-plan");
 
   const tile = findTileLine(formatDoctor(result), "AI-Assisted mode");
   assert.ok(tile, "formatDoctor should render an AI-Assisted mode tile");
@@ -217,6 +228,7 @@ test("AI-Assisted tile warns with install hint when no hook-capable host present
   assert.ok(ai);
   assert.equal(ai!.status, "warn");
   assert.match(ai!.detail ?? "", /hook-capable host/);
+  assert.equal(ai!.hintKind, "install-host");
 
   const tile = findTileLine(formatDoctor(result), "AI-Assisted mode");
   assert.ok(tile, "formatDoctor should render an AI-Assisted mode tile");
