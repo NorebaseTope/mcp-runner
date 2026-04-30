@@ -433,6 +433,102 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
     },
   ];
 
+  // Study mode (task-531) — surface that the runner can serve in-IDE study
+  // chats. Pass when the device is authorized AND at least one supported
+  // host has a config detected (so MCP study_* tools are reachable). Warn
+  // when either is missing so the user gets a clear next step. The check is
+  // local-only — it does not contact the API.
+  const hasAuthorizedToken = !!cfg.token;
+  const anyHostInstalled = hosts.some((h) => h.status === "pass");
+  const studyStatus: DoctorCheckStatus =
+    hasAuthorizedToken && anyHostInstalled ? "pass" : "warn";
+  const studyDetailParts: string[] = [];
+  if (!hasAuthorizedToken)
+    studyDetailParts.push("Run `prepsavant auth` to authorize the device.");
+  if (!anyHostInstalled)
+    studyDetailParts.push(
+      "No AI chat host config found — install Cursor, Claude Desktop, Claude Code, or Codex CLI then re-run `prepsavant install`.",
+    );
+  if (studyDetailParts.length === 0) {
+    studyDetailParts.push(
+      "MCP study_* tools are reachable. Try `prepsavant study --help`.",
+    );
+  }
+  manifest.push({
+    id: "manifest.study_mode",
+    label: "Study mode (in-IDE teaching chat)",
+    status: studyStatus,
+    detail: studyDetailParts.join(" "),
+    fixCommand: hasAuthorizedToken ? undefined : "prepsavant auth",
+  });
+
+  // Coached mode (task-567) — runs `prepsavant start` to drive a guided
+  // practice session through the runner. Same gating as Study mode (the
+  // runner needs a device token AND at least one MCP host installed) but
+  // surfaced as its own quickstart tile so first-time users can see all
+  // three run modes at a glance instead of having to scan [host] / [license]
+  // to figure out whether Coached is reachable.
+  const coachedStatus: DoctorCheckStatus =
+    hasAuthorizedToken && anyHostInstalled ? "pass" : "warn";
+  const coachedDetailParts: string[] = [];
+  if (!hasAuthorizedToken)
+    coachedDetailParts.push("Run `prepsavant auth` to authorize the device.");
+  if (!anyHostInstalled)
+    coachedDetailParts.push(
+      "No AI chat host config found — install Cursor, Claude Desktop, Claude Code, or Codex CLI then re-run `prepsavant install`.",
+    );
+  if (coachedDetailParts.length === 0) {
+    coachedDetailParts.push(
+      "`prepsavant start` ready — coached sessions available.",
+    );
+  }
+  manifest.push({
+    id: "manifest.coached_mode",
+    label: "Coached mode (`prepsavant start`)",
+    status: coachedStatus,
+    detail: coachedDetailParts.join(" "),
+    fixCommand: hasAuthorizedToken ? undefined : "prepsavant auth",
+  });
+
+  // AI-Assisted mode (task-567) — captures and grades real coding sessions
+  // by installing hooks into a hook-capable host. Pass requires a paid
+  // plan (Pro or Lifetime) AND at least one hook-capable host installed.
+  // Hook support today: Claude Code, Cursor, and Codex CLI (Claude Desktop's
+  // MCP config does not expose the hook surface AI-Assisted needs — only
+  // Claude Code, the CLI sibling, does). When the runner could not fetch a
+  // plan tier (offline / unauthenticated) we don't fail the plan side —
+  // the warn would just be misleading — and let the host side drive the
+  // tile.
+  const hookCapableHostsInstalled = hosts.some(
+    (h) =>
+      h.status === "pass" &&
+      (h.id === "host.cursor" ||
+        h.id === "host.codex" ||
+        h.id === "host.claude_code"),
+  );
+  let aiAssistedStatus: DoctorCheckStatus;
+  let aiAssistedDetail: string;
+  let aiAssistedFix: string | undefined;
+  if (opts.plan === "free") {
+    aiAssistedStatus = "warn";
+    aiAssistedDetail = `Free plan — AI-Assisted requires Pro or Lifetime. Upgrade at: ${upgradeUrl}`;
+    aiAssistedFix = upgradeUrl;
+  } else if (!hookCapableHostsInstalled) {
+    aiAssistedStatus = "warn";
+    aiAssistedDetail =
+      "No hook-capable host installed — install Claude Code, Cursor, or Codex CLI then run `prepsavant install --host cursor`.";
+  } else {
+    aiAssistedStatus = "pass";
+    aiAssistedDetail = "`prepsavant start --ai-assisted` ready to capture sessions.";
+  }
+  manifest.push({
+    id: "manifest.ai_assisted_mode",
+    label: "AI-Assisted mode (capture & grade real sessions)",
+    status: aiAssistedStatus,
+    detail: aiAssistedDetail,
+    fixCommand: aiAssistedFix,
+  });
+
   const languages: DoctorCheck[] = [];
   const py = which("python3").ok ? which("python3") : which("python");
   languages.push({
@@ -513,6 +609,61 @@ export function formatDoctor(result: DoctorResult): string {
   const lines: string[] = [];
   lines.push(`prepsavant doctor — ${result.overallStatus.toUpperCase()}`);
   lines.push(`generated ${result.generatedAt}`);
+
+  // Quickstart mode tiles (task-557, task-567): surface all three run modes
+  // — Study, Coached, AI-Assisted — at the top of the human-facing summary
+  // so first-time users notice which ones are reachable without scanning
+  // [host] / [license]. The detailed `manifest.*_mode` entries remain in
+  // the [manifest] section below for full diagnostic context. Hint copy is
+  // derived from each check's status so the tile and the detail line never
+  // drift out of sync. Each tile is a single line and stays under the
+  // 80-column line-length budget the original Study tile established.
+  const renderTile = (
+    tileLabel: string,
+    check: DoctorCheck | undefined,
+    passHint: string,
+  ): void => {
+    if (!check) return;
+    let hint: string;
+    if (check.status === "pass") {
+      hint = passHint;
+    } else if (check.status === "warn") {
+      const detail = check.detail ?? "";
+      if (check.fixCommand === "prepsavant auth") {
+        hint = "run `prepsavant auth` to enable";
+      } else if (/AI chat host|hook-capable host/.test(detail)) {
+        hint = "run `prepsavant install --host cursor` to enable";
+      } else if (/Free plan/.test(detail)) {
+        // Surface the upgrade URL verbatim so the user can click it from
+        // their terminal without copy-pasting half the detail line.
+        hint = `upgrade at ${check.fixCommand ?? ""}`.trim();
+      } else {
+        hint = detail;
+      }
+    } else {
+      hint = check.detail ?? "not checked";
+    }
+    lines.push(`  ${sym(check.status)} ${tileLabel} — ${hint}`);
+  };
+
+  const findCheck = (id: string) =>
+    result.manifest.find((c) => c.id === id);
+  renderTile(
+    "Study mode",
+    findCheck("manifest.study_mode"),
+    "`prepsavant study` ready in your IDE",
+  );
+  renderTile(
+    "Coached mode",
+    findCheck("manifest.coached_mode"),
+    "`prepsavant start` ready to run",
+  );
+  renderTile(
+    "AI-Assisted mode",
+    findCheck("manifest.ai_assisted_mode"),
+    "`prepsavant start --ai-assisted` ready",
+  );
+
   const sections: Record<string, DoctorCheck[] | undefined> = {
     host: result.host,
     license: result.license,

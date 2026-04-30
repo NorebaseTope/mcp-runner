@@ -31,6 +31,13 @@ export const DIRECTIVE_FALLBACK: Record<
     "Time is up. Commit to what you have, tell me what you would fix with more time, then we'll close the session.",
 };
 
+// Sam-voice line used when the runner-side stall watcher upgrades a
+// stay_quiet server directive into a probe because the user has stopped
+// editing files. Kept here so it lives next to the other fallback phrasings
+// the runner can speak without a server round trip.
+export const STALL_PROBE_LINE =
+  "You've gone quiet — want me to unblock you? Tell me where you got stuck and I'll nudge you forward.";
+
 const MIN_REFRESH_MS = 5 * 60 * 1000;
 
 export interface ResolvedPersona {

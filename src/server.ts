@@ -28,6 +28,23 @@ import {
 import { PersonaCache, DIRECTIVE_FALLBACK } from "./persona-cache.js";
 import type { CheckInDirective } from "./api.js";
 import { sampleSamVoice, tryExtractJson } from "./sampling.js";
+import {
+  startCoachedSession,
+  getCoachedSession,
+  endCoachedSession,
+  recordAiAssist,
+  updateHintLevel,
+} from "./coached/session.js";
+import {
+  buildCheckInPayload,
+  isStallEscalation,
+  resolveCoachedWorkDir,
+} from "./coached/check-in.js";
+import {
+  buildCoachedPostMortemText,
+  formatCoachedEndSessionResponse,
+} from "./coached/post-mortem.js";
+import { consumeStudyAskStream } from "./study/stream-consumer.js";
 
 // Surfaces the runner is allowed to push back into the dashboard's enrichment
 // cache. Mirrors the server-side TemplateSurface union — kept here as a
@@ -170,7 +187,7 @@ export async function runMcpServer(): Promise<void> {
     "practice_start_session",
     {
       description:
-        "Start a new practice session for a given question. Returns the session id and the kickoff brief (which contains HOST INSTRUCTIONS for proactive cadence). Optionally pass targetDurationMinutes to enable timed-session directives.",
+        "DEPRECATED — use coached_start_session instead. Start a new practice session for a given question. Returns the session id and the kickoff brief.",
       inputSchema: {
         questionId: z.string(),
         companyId: z.string().optional(),
@@ -204,7 +221,7 @@ export async function runMcpServer(): Promise<void> {
     "practice_submit_attempt",
     {
       description:
-        "Run the user's solution against the pinned tests in a local sandbox, push the graded attempt to Sam, and produce a Sam-voice review.",
+        "DEPRECATED — use practice_submit_attempt only for sessions started via practice_start_session. For new Coached sessions, submit attempts via your editor's run/test tools. Run the user's solution against the pinned tests in a local sandbox, push the graded attempt to Sam, and produce a Sam-voice review.",
       inputSchema: {
         sessionId: z.string(),
         language: z.enum(["python", "javascript", "typescript"]),
@@ -352,7 +369,7 @@ export async function runMcpServer(): Promise<void> {
   server.registerTool(
     "practice_request_hint",
     {
-      description: "Ask Sam for the next hint on the active session.",
+      description: "DEPRECATED — use coached_ask for Coached sessions. Ask Sam for the next hint on the active session.",
       inputSchema: { sessionId: z.string() },
     },
     async (args) => {
@@ -374,7 +391,7 @@ export async function runMcpServer(): Promise<void> {
     "practice_check_in",
     {
       description:
-        "Check in with Sam during an active practice session. Returns a directive: stay_quiet (do nothing), probe (surface the samVoiceLine to the user verbatim), hint_offer (tell the user a hint is available), time_warning, or wrap_up. Call this after every user message during a session, or on a ~3 min heartbeat. The host MUST speak samVoiceLine verbatim when action is not stay_quiet.",
+        "DEPRECATED — use coached_check_in for new Coached sessions. Check in with Sam during an active practice session. Returns a directive: stay_quiet (do nothing), probe (surface the samVoiceLine to the user verbatim), hint_offer (tell the user a hint is available), time_warning, or wrap_up.",
       inputSchema: { sessionId: z.string() },
     },
     async (args) => {
@@ -403,12 +420,655 @@ export async function runMcpServer(): Promise<void> {
   server.registerTool(
     "practice_end_session",
     {
-      description: "End the active practice session.",
+      description: "DEPRECATED — use coached_end_session for new Coached sessions. End the active practice session.",
       inputSchema: { sessionId: z.string() },
     },
     async (args) => {
       await api.endSession(args.sessionId);
       return asText("Session ended.");
+    },
+  );
+
+  // =====================================================================
+  // COACHED MODE TOOLS
+  // These tools run the Coached session lifecycle entirely inside the user's
+  // real editor + AI chat host (Cursor, Claude Desktop, Codex). Sam watches
+  // the project passively and delivers nudges when the user stalls. AI usage
+  // during a Coached session is detected and flagged in the recap, not blocked.
+  // =====================================================================
+
+  // ---------------------------------------------------------------------
+  // coached_pick_question — browse and filter available questions from chat.
+  // A user can type "give me a coached question for [role/topic]" and Sam
+  // returns matching questions without opening the webapp.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_pick_question",
+    {
+      description:
+        "List interview-prep questions available for a Coached session, optionally filtered by role family, difficulty, or language. Returns questions the user can pick from to start a Coached session via coached_start_session.",
+      inputSchema: {
+        roleFamily: z
+          .enum(["swe", "data", "ml", "infra", "mobile", "security", "other"])
+          .optional(),
+        difficulty: z.enum(["easy", "medium", "hard"]).optional(),
+        language: z
+          .enum(["python", "javascript", "typescript"])
+          .optional(),
+      },
+    },
+    async (args) => {
+      const raw = await api.listQuestions();
+      const items = raw.items.filter((q) => {
+        if (args.roleFamily && q.roleFamily !== args.roleFamily) return false;
+        if (args.difficulty && (q as { difficulty?: string }).difficulty !== args.difficulty) return false;
+        if (args.language) {
+          const langs = q.languages ?? [];
+          if (!langs.includes(args.language)) return false;
+        }
+        return true;
+      });
+      if (items.length === 0) {
+        return asText(
+          "No questions match those filters. Try removing one of the filters or ask with no filters to see all questions.",
+        );
+      }
+      const lines = items.map(
+        (q) =>
+          `${q.id}\t${q.title} [${q.roleFamily}] (${q.languages.join(", ")})`,
+      );
+      return asText(
+        [
+          `Found ${items.length} question(s). Pick one and call coached_start_session with its id.`,
+          "",
+          ...lines,
+        ].join("\n"),
+      );
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // coached_start_session — start a Coached session entirely from chat.
+  // Delivers the question + brief into the AI chat so the user never has
+  // to open the webapp. Optionally accepts workspaceDir to enable passive
+  // file-system watching for stall detection.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_start_session",
+    {
+      description:
+        "Start a new Coached session for a given question. Delivers the question prompt and session brief into chat. The host should follow the HOST INSTRUCTIONS in the response to drive coaching nudges. Pass workDir (absolute path to the project folder) to enable stall detection via file-system watching; defaults to the runner's current working directory when omitted. `workspaceDir` is accepted as a backward-compatible alias.",
+      inputSchema: {
+        questionId: z.string(),
+        companyId: z.string().optional(),
+        targetDurationMinutes: z.number().int().min(5).max(180).optional(),
+        workDir: z.string().optional(),
+        // Backward-compatible alias for hosts pinned to the older field name.
+        // `workDir` wins when both are present.
+        workspaceDir: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const start = await api.startSession({
+        questionId: args.questionId,
+        companyId: args.companyId,
+        targetDurationMinutes: args.targetDurationMinutes,
+      });
+      const detail = (await api.getSession(start.sessionId)) as {
+        question?: { title?: string; prompt?: string };
+        kickoffBriefVerbatim?: string;
+      };
+
+      const questionTitle = detail.question?.title ?? "Interview question";
+      const questionPrompt = detail.question?.prompt ?? "";
+
+      startCoachedSession({
+        sessionId: start.sessionId,
+        questionId: args.questionId,
+        questionTitle,
+        questionPrompt,
+        workspaceDir: resolveCoachedWorkDir(args),
+      });
+
+      const brief = [
+        `session_id: ${start.sessionId}`,
+        "",
+        `# ${questionTitle}`,
+        "",
+        questionPrompt,
+        "",
+        "---",
+        "",
+        "HOST INSTRUCTIONS (Coached mode — follow exactly):",
+        "1. Call coached_check_in after every user message and at least every 3 minutes.",
+        "2. coached_check_in returns a directive. When action is not \"stay_quiet\", speak samVoiceLine verbatim.",
+        "3. If YOU generate, edit, or refactor code for the user — not as a coaching nudge but as direct assistance — call coached_check_in with aiAssistDetected:true and a brief aiAssistSummary describing what you did. This is detection only; the session continues.",
+        "4. Do NOT give the user a direct solution unless they explicitly ask Sam to switch to explanation mode.",
+        "5. When the user ends the session or says they are done, call coached_end_session.",
+        args.targetDurationMinutes
+          ? `6. This is a timed session: ${args.targetDurationMinutes} minutes.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return asText(brief);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // coached_ask — clarifying questions about the problem, answered by Sam
+  // in the study/coach persona. Available at any time during a Coached
+  // session. Sam answers without giving away the solution.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_ask",
+    {
+      description:
+        "Ask Sam a clarifying question about the current Coached session's problem. Sam answers in the coaching persona — explains concepts, gives hints when prompted, but does not hand over a full solution unprompted. Pass the sessionId so Sam can scope the answer to the right problem.",
+      inputSchema: {
+        sessionId: z.string(),
+        question: z.string().min(1),
+      },
+    },
+    async (args) => {
+      const state = getCoachedSession(args.sessionId);
+      let questionContext = "";
+      if (state) {
+        questionContext = `\n\nProblem being coached:\nTitle: ${state.questionTitle}\n\n${state.questionPrompt}`;
+      } else {
+        try {
+          const detail = (await api.getSession(args.sessionId)) as {
+            question?: { title?: string; prompt?: string };
+          };
+          if (detail.question) {
+            questionContext = `\n\nProblem being coached:\nTitle: ${detail.question.title ?? ""}\n\n${detail.question.prompt ?? ""}`;
+          }
+        } catch {
+        }
+      }
+
+      const systemPrompt = await samplingSystemPrompt();
+      const userPrompt = [
+        `The user is in a Coached session and has a clarifying question about the problem. Answer it in Sam's coaching persona — explain concepts freely, give hints when explicitly requested, but do not hand over a full working solution unless the user explicitly asks to switch to explanation mode.`,
+        questionContext,
+        `\nUser's question: ${args.question}`,
+      ].join("");
+
+      const sampling = await sampleSamVoice(
+        server.server,
+        systemPrompt,
+        userPrompt,
+        "I can't answer that right now. Try rephrasing or ask in the webapp.",
+      );
+      return asText(sampling.text);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // coached_check_in — periodic heartbeat during a Coached session.
+  // Returns a directive telling the host whether to stay quiet, offer a
+  // hint, probe the user, or issue a time warning. Also accepts AI-assist
+  // reports from the host so the runner can accumulate and persist them.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_check_in",
+    {
+      description:
+        "Check in with Sam during an active Coached session. Returns a directive: stay_quiet, probe, hint_offer, time_warning, or wrap_up. Call this after every user message and on a ~3 min heartbeat. If you (the host) generated or edited code on the user's behalf, set aiAssistDetected:true and describe what you did in aiAssistSummary.",
+      inputSchema: {
+        sessionId: z.string(),
+        aiAssistDetected: z.boolean().optional(),
+        aiAssistSummary: z.string().optional(),
+      },
+    },
+    async (args) => {
+      // Each call to coached_check_in with aiAssistDetected:true represents
+      // exactly one AI-assist event. We always post delta=1 so the server-side
+      // counter increments correctly regardless of how many prior events have
+      // been accumulated locally.
+      if (args.aiAssistDetected) {
+        recordAiAssist(args.sessionId, args.aiAssistSummary ?? "");
+        await api.pushCoachedAiAssist(args.sessionId, {
+          count: 1,
+          summary: args.aiAssistSummary,
+        }).catch(() => {});
+      }
+
+      const directive = await api.checkIn(args.sessionId);
+      const state = getCoachedSession(args.sessionId);
+      // Detect runner-driven stall escalation BEFORE building the payload
+      // (buildCheckInPayload returns the post-escalation directive). If the
+      // server said `stay_quiet` and we upgraded it because the user has
+      // stopped editing files, report a stall_nudge event back to the API
+      // so the post-mortem can surface how often Sam had to break the
+      // silence (Task #564). Best-effort — we never block the directive
+      // delivery on the network call.
+      if (isStallEscalation(directive, state)) {
+        await api.pushCoachedStallNudge(args.sessionId, { count: 1 }).catch(() => {});
+      }
+      const payload = buildCheckInPayload(directive, state);
+      return asText(JSON.stringify(payload));
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // coached_end_session — end session + deliver in-chat post-mortem.
+  // Sam walks through what happened: score, what was hit/missed, and
+  // an explicit offer to continue the debrief via coached_ask.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_end_session",
+    {
+      description:
+        "End the active Coached session and receive an in-chat post-mortem from Sam: score summary, what was hit or missed, AI assistance flag (if any), and an invitation to ask follow-up questions via coached_ask.",
+      inputSchema: { sessionId: z.string() },
+    },
+    async (args) => {
+      const state = endCoachedSession(args.sessionId);
+
+      // End the session first so the server-side row reflects the final
+      // status before we fetch detail. The detail call is the
+      // authoritative source of truth for AI-assist counts (they're
+      // posted via /coached-events from outside the runner's in-memory
+      // state, e.g. by host-side hooks).
+      await api.endSession(args.sessionId).catch(() => {});
+
+      let detail: {
+        session?: {
+          attemptsTotal?: number;
+          hintsUsed?: number;
+          passedLatest?: boolean;
+          coachedAiAssistDetected?: boolean;
+          coachedAiAssistCount?: number;
+          coachedStallNudgeCount?: number;
+        };
+        question?: { title?: string };
+        attempts?: Array<{ outcome?: string }>;
+        hints?: Array<unknown>;
+      } = {};
+      try {
+        detail = (await api.getSession(args.sessionId)) as typeof detail;
+      } catch {
+      }
+
+      // Prefer server-authoritative AI-assist counts; fall back to the
+      // runner's in-memory state if the detail fetch failed.
+      const serverAiAssistCount = detail.session?.coachedAiAssistCount;
+      const serverAiAssistDetected = detail.session?.coachedAiAssistDetected;
+      const inMemoryAiAssistCount = state?.aiAssistCount ?? 0;
+      const aiAssistCount =
+        typeof serverAiAssistCount === "number"
+          ? serverAiAssistCount
+          : inMemoryAiAssistCount;
+      const aiAssistDetected =
+        typeof serverAiAssistDetected === "boolean"
+          ? serverAiAssistDetected
+          : inMemoryAiAssistCount > 0;
+      const aiAssistSummaries = state?.aiAssistSummaries ?? [];
+      const questionTitle =
+        detail.question?.title ?? state?.questionTitle ?? "the problem";
+      const attemptsTotal = detail.session?.attemptsTotal ?? detail.attempts?.length ?? 0;
+      const hintsUsed = detail.session?.hintsUsed ?? detail.hints?.length ?? 0;
+      const passedLatest = detail.session?.passedLatest;
+      // Stall-nudge counts only live server-side (Task #564) — the runner
+      // doesn't keep an in-memory accumulator. If the detail fetch failed,
+      // fall back to 0 rather than fabricating a value.
+      const stallNudgeCount = detail.session?.coachedStallNudgeCount ?? 0;
+
+      const postMortem = buildCoachedPostMortemText({
+        questionTitle,
+        attemptsTotal,
+        hintsUsed,
+        passedLatest,
+        aiAssistDetected,
+        aiAssistCount,
+        aiAssistSummaries,
+        stallNudgeCount,
+      });
+
+      return asText(
+        formatCoachedEndSessionResponse({
+          session_id: args.sessionId,
+          status: "ended",
+          coachedAiAssistDetected: aiAssistDetected,
+          coachedAiAssistCount: aiAssistCount,
+          coachedStallNudgeCount: stallNudgeCount,
+          postMortem,
+        }),
+      );
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // Study mode tools (task-531)
+  //
+  // These tools let the host model run a teaching chat with Sam scoped to
+  // a single problem. Conversations are persisted into the existing
+  // study_conversations / study_conversation_messages tables — the same
+  // ones the dashboard's Study chat viewer reads from. Critically, the
+  // study path NEVER writes to sessions / attempts / hint_events: this is
+  // a learning surface only and must not inflate practice counters.
+  //
+  // Flow:
+  //   1) Host calls study_start with a questionId (optionally postSessionId
+  //      for a post-session reflection). Tool creates the conversation
+  //      server-side and returns a kickoff brief that includes the problem
+  //      prompt + the verbatim Sam study persona + handoff instructions
+  //      for the host model.
+  //   2) Host generates Sam's reply locally for each user turn, then
+  //      calls study_send_message with both the user message and Sam's
+  //      reply. The runner persists both turns.
+  //   3) Host can call study_get_history to read back the transcript.
+  // ---------------------------------------------------------------------
+
+  // Inline persona builder shared with the server-side cookie path so the
+  // host model receives the exact same study persona the webapp would use.
+  function buildStudyPersonaPrompt(args: {
+    question: {
+      id: string;
+      title: string;
+      prompt: string;
+      difficulty: string;
+      estimatedMinutes: number;
+    };
+    mode: "study" | "post_session";
+  }): string {
+    const { question, mode } = args;
+    const teachingRules = [
+      `You are Sam — a senior interview coach in teaching mode.`,
+      `The user is studying one problem and can ask anything about it.`,
+      ``,
+      `Tone:`,
+      `- Short paragraphs. Concrete examples. No emoji. No flattery.`,
+      ``,
+      `Teaching-mode rules:`,
+      `- Stay scoped to "${question.title}". Do not drift into general career advice or other problems.`,
+      `- Explain concepts, patterns, canonical approaches, and tradeoffs freely — this is NOT a proctored session.`,
+      `- Do not dump a full worked solution unprompted. If asked directly for a solution, give it.`,
+      `- Do not reveal hidden test cases verbatim. You may describe what kinds of inputs are covered.`,
+      `- If the user pastes code, read it and give specific feedback. Do not invent behavior the code doesn't have.`,
+      `- Prefer ending each reply with one focused question to guide the user's thinking.`,
+    ].join("\n");
+
+    const problemContext = [
+      ``,
+      `Current problem:`,
+      `Title: ${question.title}`,
+      `Difficulty: ${question.difficulty}`,
+      `Estimated time: ${question.estimatedMinutes} minutes`,
+      ``,
+      `Problem prompt:`,
+      question.prompt,
+    ].join("\n");
+
+    const modeNote =
+      mode === "post_session"
+        ? `\n\nThis is a post-session reflection. The user just finished a graded session on this problem. The opening message (already in the transcript) summarized that session. Continue from there.`
+        : ``;
+
+    return teachingRules + problemContext + modeNote;
+  }
+
+  server.registerTool(
+    "study_start",
+    {
+      description:
+        "Open a study (teaching) conversation with Sam scoped to one problem. Pass a questionId for a fresh study chat, or postSessionId (with the same questionId) for a post-session reflection. Returns a conversationId and the kickoff brief: persona/system rules + the problem prompt the host model should follow when replying as Sam. Study chats are persisted but never create graded sessions, attempts, or hints.",
+      inputSchema: {
+        questionId: z.string().min(1),
+        postSessionId: z.string().min(1).optional(),
+      },
+    },
+    async (args) => {
+      const mode: "study" | "post_session" = args.postSessionId
+        ? "post_session"
+        : "study";
+      let detail;
+      try {
+        detail = await api.createStudyConversation({
+          questionId: args.questionId,
+          mode,
+          ...(args.postSessionId ? { sessionId: args.postSessionId } : {}),
+        });
+      } catch (err) {
+        return asText(
+          `Could not open study conversation: ${(err as Error).message}`,
+        );
+      }
+      const personaPrompt = buildStudyPersonaPrompt({
+        question: detail.question,
+        mode: detail.mode,
+      });
+      const opener =
+        detail.messages.length > 0
+          ? `\n\nOpening message already in the transcript (Sam):\n${detail.messages[detail.messages.length - 1]!.body}`
+          : "";
+      const kickoffBrief = [
+        `conversation_id: ${detail.id}`,
+        `mode: ${detail.mode}`,
+        `question_id: ${detail.questionId}`,
+        ``,
+        `--- Study persona (only used if you fall back to study_send_message) ---`,
+        personaPrompt,
+        opener,
+        ``,
+        `--- Handoff to host ---`,
+        `Preferred: after each user turn, call study_ask with conversationId="${detail.id}" and userMessage=<the user's text>. The runner streams Sam's real reply from prepsavant.com (matching the web Sam) and persists both the user turn and Sam's full reply on the server. Show the returned text to the user verbatim.`,
+        `Fallback: if you cannot use study_ask, generate Sam's reply locally using the persona above and call study_send_message with the user message and your Sam reply so both turns are persisted.`,
+        `Do not mix the two for the same turn — that would double-persist the user message.`,
+        `Do not call study_start again for this question/session unless the user explicitly wants a new conversation.`,
+      ].join("\n");
+      return asText(kickoffBrief);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // study_ask (task-555) — preferred path for IDE study turns.
+  //
+  // Streams Sam's reply from prepsavant.com so the IDE chat sees Sam's
+  // actual model output (matching the web Sam experience), not whatever
+  // the host AI would have improvised. The runner calls the streaming
+  // server endpoint, accumulates deltas, optionally forwards them to the
+  // host as `notifications/message` so progressive UIs can render them,
+  // and returns the full Sam reply as the tool's text result.
+  //
+  // The server persists BOTH the user message and Sam's full reply into
+  // study_conversation_messages, so the host MUST NOT also call
+  // study_send_message after study_ask — that would double-write the user
+  // turn. study_send_message remains for hosts that want to drive Sam
+  // entirely from the local model.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "study_ask",
+    {
+      description:
+        "Ask Sam in an open study conversation and stream his real reply from prepsavant.com. Persists both the user turn and Sam's full generated reply into the conversation transcript on the server — DO NOT also call study_send_message for the same turn. Returns Sam's full reply text. The runner forwards streamed chunks as MCP notifications/message events so chat UIs that render them can show Sam's voice live as it lands.",
+      inputSchema: {
+        conversationId: z.string().min(1),
+        userMessage: z.string().min(1).max(8000),
+      },
+    },
+    async (args, extra) => {
+      // Best-effort notification helper. Silently ignore send failures —
+      // the typing indicator and live deltas are progressive niceties;
+      // the final tool text always carries the full reply.
+      const notify = async (data: Record<string, unknown>): Promise<void> => {
+        if (!extra?.sendNotification) return;
+        try {
+          await extra.sendNotification({
+            method: "notifications/message",
+            params: {
+              level: "info",
+              logger: "study_ask",
+              data: { conversationId: args.conversationId, ...data },
+            },
+          });
+        } catch {
+          /* noop */
+        }
+      };
+      let full = "";
+      let errored: string | null = null;
+      try {
+        const result = await consumeStudyAskStream(
+          api.streamStudyMessage(args.conversationId, {
+            body: args.userMessage,
+          }),
+          notify,
+        );
+        full = result.full;
+        errored = result.error;
+      } catch (err) {
+        errored = err instanceof Error ? err.message : String(err);
+      }
+
+      if (errored && !full) {
+        return asText(`Could not generate Sam's reply: ${errored}`);
+      }
+      if (errored) {
+        // Partial reply: return what we got with a footer so the host can
+        // see generation didn't finish cleanly.
+        return asText(`${full}\n\n(stream ended early: ${errored})`);
+      }
+      return asText(full);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // study_retry (task-571) — recover when a previous study_ask was
+  // interrupted (model error or stream disconnect after the user turn
+  // landed on the server). Re-runs Sam against the trailing user turn
+  // already persisted in the conversation, so the user does not have to
+  // re-type their question and the transcript does not gain a duplicate
+  // user message.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "study_retry",
+    {
+      description:
+        "Retry Sam's reply for the trailing (unanswered) user turn of a study conversation when a previous study_ask call returned an error or was interrupted mid-stream. Does NOT insert a new user message — the user's last question is already saved on the server. Returns Sam's full reply text. Refuses if the last message in the conversation is already from Sam (nothing to recover).",
+      inputSchema: {
+        conversationId: z.string().min(1),
+      },
+    },
+    async (args, extra) => {
+      let full = "";
+      let errored: string | null = null;
+      try {
+        for await (const evt of api.retryStudyMessage(args.conversationId)) {
+          if (evt.type === "delta") {
+            full += evt.text;
+            if (extra?.sendNotification) {
+              try {
+                await extra.sendNotification({
+                  method: "notifications/message",
+                  params: {
+                    level: "info",
+                    logger: "study_retry",
+                    data: {
+                      conversationId: args.conversationId,
+                      delta: evt.text,
+                    },
+                  },
+                });
+              } catch {
+                /* noop */
+              }
+            }
+          } else if (evt.type === "error") {
+            errored = evt.error;
+            break;
+          }
+        }
+      } catch (err) {
+        errored = err instanceof Error ? err.message : String(err);
+      }
+
+      if (errored && !full) {
+        return asText(`Could not retry Sam's reply: ${errored}`);
+      }
+      if (errored) {
+        return asText(`${full}\n\n(stream ended early: ${errored})`);
+      }
+      return asText(full);
+    },
+  );
+
+  server.registerTool(
+    "study_send_message",
+    {
+      description:
+        "Persist one turn of a study conversation when you (the host) have already generated Sam's reply locally. Prefer study_ask, which streams Sam's real reply from prepsavant.com. Use study_send_message only when the host model is intentionally driving Sam itself. Both messages are appended in order: user first, then sam. Returns the persisted message ids and createdAt timestamps.",
+      inputSchema: {
+        conversationId: z.string().min(1),
+        userMessage: z.string().min(1).max(8000),
+        samReply: z.string().min(1).max(8000),
+      },
+    },
+    async (args) => {
+      try {
+        const userMsg = await api.appendStudyMessage(args.conversationId, {
+          role: "user",
+          body: args.userMessage,
+        });
+        const samMsg = await api.appendStudyMessage(args.conversationId, {
+          role: "sam",
+          body: args.samReply,
+        });
+        return asText(
+          [
+            `conversation_id: ${args.conversationId}`,
+            `persisted: 2 messages`,
+            `user_message_id: ${userMsg.message.id} (${userMsg.message.createdAt})`,
+            `sam_message_id:  ${samMsg.message.id} (${samMsg.message.createdAt})`,
+          ].join("\n"),
+        );
+      } catch (err) {
+        return asText(
+          `Could not persist study turn: ${(err as Error).message}`,
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "study_get_history",
+    {
+      description:
+        "Read back the full transcript of a study conversation: all user and Sam messages in chronological order, plus the problem context. Use this to refresh context after the host's chat scrollback has been truncated.",
+      inputSchema: {
+        conversationId: z.string().min(1),
+      },
+    },
+    async (args) => {
+      let detail;
+      try {
+        detail = await api.getStudyConversation(args.conversationId);
+      } catch (err) {
+        return asText(
+          `Could not load study conversation: ${(err as Error).message}`,
+        );
+      }
+      const transcript =
+        detail.messages.length === 0
+          ? "(no messages yet)"
+          : detail.messages
+              .map(
+                (m) =>
+                  `[${m.createdAt}] ${m.role === "sam" ? "Sam" : "User"}: ${m.body}`,
+              )
+              .join("\n\n");
+      return asText(
+        [
+          `conversation_id: ${detail.id}`,
+          `mode: ${detail.mode}`,
+          `question: ${detail.question.title} (${detail.question.id})`,
+          ``,
+          `--- Transcript (${detail.messages.length} messages) ---`,
+          transcript,
+        ].join("\n"),
+      );
     },
   );
 
