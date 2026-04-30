@@ -16,6 +16,16 @@ import { isRunnerOutdated } from "@workspace/mcp-runner-version/compare";
 
 export type DoctorCheckStatus = "pass" | "fail" | "warn" | "skipped";
 
+// Typed classifier for the actionable hint a renderer should show next to
+// a warn-state quickstart tile. Mirrors the `hintKind` enum in
+// lib/api-spec/openapi.yaml so the dashboard's resolveTileHint and the
+// CLI's renderTile can branch on a stable value instead of regex-sniffing
+// free-form `detail` copy. When the runner reword detail strings, the
+// renderers stay correct because they only look at this field. Set ONLY
+// on warn-state quickstart checks; pass/skipped/fail render the pass-hint
+// or raw detail directly so they don't need a kind.
+export type DoctorHintKind = "auth" | "install-host" | "upgrade-plan";
+
 export interface DoctorCheck {
   id: string;
   label: string;
@@ -23,6 +33,7 @@ export interface DoctorCheck {
   detail?: string;
   fixCommand?: string;
   version?: string;
+  hintKind?: DoctorHintKind;
 }
 
 export interface DoctorResult {
@@ -454,12 +465,23 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
       "MCP study_* tools are reachable. Try `prepsavant study --help`.",
     );
   }
+  // hintKind classifier: when a tile is in warn state the renderers need to
+  // know which actionable affordance to show. Auth gating wins over the
+  // host-install gating because authorizing is a strict prerequisite —
+  // installing a host without a token would still leave the tile warn.
+  const studyHintKind: DoctorHintKind | undefined =
+    studyStatus === "warn"
+      ? !hasAuthorizedToken
+        ? "auth"
+        : "install-host"
+      : undefined;
   manifest.push({
     id: "manifest.study_mode",
     label: "Study mode (in-IDE teaching chat)",
     status: studyStatus,
     detail: studyDetailParts.join(" "),
     fixCommand: hasAuthorizedToken ? undefined : "prepsavant auth",
+    ...(studyHintKind ? { hintKind: studyHintKind } : {}),
   });
 
   // Coached mode (task-567) — runs `prepsavant start` to drive a guided
@@ -482,12 +504,19 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
       "`prepsavant start` ready — coached sessions available.",
     );
   }
+  const coachedHintKind: DoctorHintKind | undefined =
+    coachedStatus === "warn"
+      ? !hasAuthorizedToken
+        ? "auth"
+        : "install-host"
+      : undefined;
   manifest.push({
     id: "manifest.coached_mode",
     label: "Coached mode (`prepsavant start`)",
     status: coachedStatus,
     detail: coachedDetailParts.join(" "),
     fixCommand: hasAuthorizedToken ? undefined : "prepsavant auth",
+    ...(coachedHintKind ? { hintKind: coachedHintKind } : {}),
   });
 
   // AI-Assisted mode (task-567) — captures and grades real coding sessions
@@ -509,14 +538,17 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
   let aiAssistedStatus: DoctorCheckStatus;
   let aiAssistedDetail: string;
   let aiAssistedFix: string | undefined;
+  let aiAssistedHintKind: DoctorHintKind | undefined;
   if (opts.plan === "free") {
     aiAssistedStatus = "warn";
     aiAssistedDetail = `Free plan — AI-Assisted requires Pro or Lifetime. Upgrade at: ${upgradeUrl}`;
     aiAssistedFix = upgradeUrl;
+    aiAssistedHintKind = "upgrade-plan";
   } else if (!hookCapableHostsInstalled) {
     aiAssistedStatus = "warn";
     aiAssistedDetail =
       "No hook-capable host installed — install Claude Code, Cursor, or Codex CLI then run `prepsavant install --host cursor`.";
+    aiAssistedHintKind = "install-host";
   } else {
     aiAssistedStatus = "pass";
     aiAssistedDetail = "`prepsavant start --ai-assisted` ready to capture sessions.";
@@ -527,6 +559,7 @@ export function runDoctor(opts: DoctorOptions = {}): DoctorResult {
     status: aiAssistedStatus,
     detail: aiAssistedDetail,
     fixCommand: aiAssistedFix,
+    ...(aiAssistedHintKind ? { hintKind: aiAssistedHintKind } : {}),
   });
 
   const languages: DoctorCheck[] = [];
@@ -628,17 +661,25 @@ export function formatDoctor(result: DoctorResult): string {
     if (check.status === "pass") {
       hint = passHint;
     } else if (check.status === "warn") {
-      const detail = check.detail ?? "";
-      if (check.fixCommand === "prepsavant auth") {
-        hint = "run `prepsavant auth` to enable";
-      } else if (/AI chat host|hook-capable host/.test(detail)) {
-        hint = "run `prepsavant install --host cursor` to enable";
-      } else if (/Free plan/.test(detail)) {
-        // Surface the upgrade URL verbatim so the user can click it from
-        // their terminal without copy-pasting half the detail line.
-        hint = `upgrade at ${check.fixCommand ?? ""}`.trim();
-      } else {
-        hint = detail;
+      // Switch on the typed hintKind the runner stamped onto the check.
+      // The dashboard's resolveTileHint mirrors this exact branch table —
+      // when you change one, change the other (see DoctorOutput.tsx). No
+      // regex sniffing of `detail` here on purpose: rewording the detail
+      // copy must not silently change which affordance the tile shows.
+      switch (check.hintKind) {
+        case "auth":
+          hint = "run `prepsavant auth` to enable";
+          break;
+        case "install-host":
+          hint = "run `prepsavant install --host cursor` to enable";
+          break;
+        case "upgrade-plan":
+          // Surface the upgrade URL verbatim so the user can click it from
+          // their terminal without copy-pasting half the detail line.
+          hint = `upgrade at ${check.fixCommand ?? ""}`.trim();
+          break;
+        default:
+          hint = check.detail ?? "";
       }
     } else {
       hint = check.detail ?? "not checked";
