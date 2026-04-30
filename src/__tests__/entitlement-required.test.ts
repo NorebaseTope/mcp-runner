@@ -63,7 +63,11 @@ test("formatEntitlementRequiredMessage: includes the upgrade URL for the configu
     requiredEntitlement: "pro",
   };
   const msg = formatEntitlementRequiredMessage("https://prepsavant.com", body);
-  assert.match(msg, /AI-Assisted requires PrepSavant Pro/);
+  // The user-facing copy now uses the "$299 — until you're hired" framing
+  // instead of the legacy Pro/Lifetime tier labels (matches doctor + dashboard).
+  assert.match(msg, /AI-Assisted requires the PrepSavant \$299 plan/);
+  assert.match(msg, /\("until you're hired"\)/);
+  assert.doesNotMatch(msg, /Lifetime/);
   assert.match(msg, /Upgrade at: https:\/\/prepsavant\.com\/pricing/);
 });
 
@@ -80,11 +84,16 @@ test("formatEntitlementRequiredMessage: trims trailing slash on the base URL", (
   assert.equal(msg.includes("//pricing"), false);
 });
 
-test("formatEntitlementRequiredMessage: labels the tier as Lifetime when required", () => {
+test("formatEntitlementRequiredMessage: keeps the same copy even when entitlement is 'lifetime'", () => {
+  // The internal `requiredEntitlement === "lifetime"` value is still flowed
+  // through (other code paths rely on it), but the user-facing copy no longer
+  // changes per tier — it always reads as the "$299 — until you're hired"
+  // framing and never says "Lifetime".
   const body: EntitlementRequiredErrorBody = {
     error: "entitlement_required",
     requiredEntitlement: "lifetime",
   };
   const msg = formatEntitlementRequiredMessage("https://prepsavant.com", body);
-  assert.match(msg, /AI-Assisted requires PrepSavant Lifetime/);
+  assert.match(msg, /AI-Assisted requires the PrepSavant \$299 plan/);
+  assert.doesNotMatch(msg, /Lifetime/);
 });
