@@ -1,6 +1,6 @@
 {
   "name": "@prepsavant/mcp",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Local Sam MCP runner — pinned-test sandbox grading and MCP-sampling persona for the Sam interview-prep coach.",
   "license": "MIT",
   "homepage": "https://github.com/NorebaseTope/mcp-runner",
