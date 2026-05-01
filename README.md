@@ -258,6 +258,37 @@ A CI guardrail (`.github/workflows/mcp-runner-version-sync.yml`) runs
 relevant files and on a daily cron, so the constants don't silently lag
 behind npm if no one happens to touch the runner files between releases.
 
+### Pre-merge guard: version bump on runner-code changes
+
+A second guardrail (`.github/workflows/mcp-runner-version-bump.yml`,
+mirrored locally as the `mcp-runner-version-bump` validation step)
+fails when a PR changes runner-published code without also bumping
+`packages/mcp-runner/package.json` `version`. This catches the case
+where a sync to the public mirror lands but the public repo's
+auto-publish step skips publishing because the version on the file
+matches what's already on npm — leaving the npm tarball silently
+behind both the mirror and the monorepo.
+
+Release-relevant changes are: `packages/mcp-runner/src/**`
+(excluding tests), `build.mjs`, `README.md`, `LICENSE`, the vendored
+libs (`lib/sam-market-context-shared/src/**`,
+`lib/ai-assisted-events/src/**`), and any non-`version` field in the
+runner `package.json`.
+
+**Escape hatch:** if a runner-code change genuinely doesn't need a
+publish (a comment-only fix, a pure rename, a refactor with no
+behavioural delta), add a `Skip-Mcp-Runner-Bump: <reason>` trailer to
+one of the commits in the PR, e.g.:
+
+```
+fix(runner): rename internal helper for clarity
+
+Skip-Mcp-Runner-Bump: pure rename, no shipped behavioural change
+```
+
+The reason is required (an empty trailer doesn't pass) and is shown in
+the success log so it stays auditable.
+
 ### Required secrets (public repo)
 
 - `NPM_TOKEN` — Classic Automation token for the `@prepsavant` scope, or
