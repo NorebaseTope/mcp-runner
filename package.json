@@ -1,21 +1,25 @@
 {
   "name": "@prepsavant/mcp",
-  "version": "0.4.2",
+  "version": "2.3.0",
   "description": "Local Sam MCP runner — pinned-test sandbox grading and MCP-sampling persona for the Sam interview-prep coach.",
   "license": "MIT",
-  "homepage": "https://github.com/NorebaseTope/mcp-runner",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/NorebaseTope/mcp-runner.git"
-  },
-  "bugs": {
-    "url": "https://github.com/NorebaseTope/mcp-runner/issues"
-  },
   "bin": {
     "prepsavant": "dist/cli.js"
   },
   "type": "module",
   "main": "dist/cli.js",
+  "exports": {
+    ".": "./dist/cli.js",
+    "./sandbox/node": "./src/sandbox/node.ts",
+    "./sandbox/python": "./src/sandbox/python.ts",
+    "./sandbox/php": "./src/sandbox/php.ts",
+    "./sandbox/csharp": "./src/sandbox/csharp.ts",
+    "./sandbox/kotlin": "./src/sandbox/kotlin.ts",
+    "./sandbox/cpp": "./src/sandbox/cpp.ts",
+    "./sandbox/java": "./src/sandbox/java.ts",
+    "./sandbox/go": "./src/sandbox/go.ts",
+    "./sandbox/rust": "./src/sandbox/rust.ts"
+  },
   "files": [
     "dist",
     "README.md",
@@ -36,8 +40,13 @@
   },
   "devDependencies": {
     "@types/node": "^25.3.3",
+    "@workspace/ai-assisted-events": "workspace:*",
+    "@workspace/api-zod": "workspace:*",
+    "@workspace/mcp-runner-version": "workspace:*",
+    "@workspace/session-milestones": "workspace:*",
+    "@workspace/sam-market-context-shared": "workspace:*",
     "esbuild": "^0.27.3",
-    "tsx": "^4.21.0",
+    "tsx": "catalog:",
     "typescript": "^5.6.3"
   },
   "publishConfig": {

@@ -49,6 +49,31 @@ test("formatRunnerUpdateAdvisory: renders the dashboard-equivalent advisory when
   );
 });
 
+// Task #1382 — when the runner has a recorded most-recently-installed
+// host, the advisory must include `--host <id>` so users can paste the
+// printed command verbatim and land back on the same host they
+// originally configured. Without this, Sam has to correct the user
+// mid-chat ("oh, also pass --host cursor") which defeats the point of
+// surfacing a copy-pasteable command.
+test("formatRunnerUpdateAdvisory: appends --host <id> when an installed host is known", () => {
+  const out = formatRunnerUpdateAdvisory("0.3.0", "0.4.0", "cursor");
+  assert.ok(out, "expected an advisory string when installed < latest");
+  assert.match(out, /npx -y @prepsavant\/mcp install --host cursor/);
+});
+
+test("formatRunnerUpdateAdvisory: omits --host when no installed host is known", () => {
+  // Fresh machine / install-history empty → fall back to the bare
+  // command. We never invent a host.
+  const outNull = formatRunnerUpdateAdvisory("0.3.0", "0.4.0", null);
+  const outUndef = formatRunnerUpdateAdvisory("0.3.0", "0.4.0");
+  const outBlank = formatRunnerUpdateAdvisory("0.3.0", "0.4.0", "   ");
+  for (const out of [outNull, outUndef, outBlank]) {
+    assert.ok(out);
+    assert.match(out, /npx -y @prepsavant\/mcp install\n/);
+    assert.doesNotMatch(out, /--host/);
+  }
+});
+
 test("formatRunnerUpdateAdvisory: handles minor and patch bumps", () => {
   // Minor bump
   assert.ok(formatRunnerUpdateAdvisory("0.4.0", "0.5.0"));

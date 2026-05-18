@@ -10,12 +10,31 @@ export interface RunnerConfig {
   deviceId?: string;
   label?: string;
   authorizedAt?: string;
+  // Task #1401 — optional adapter override for the Coached terminal
+  // coach. Resolved by `resolveCodingAgent()` in
+  // `coached/coding-agent.ts`. When omitted, the runner shells out to
+  // `cursor-agent` from PATH.
+  codingAgent?: {
+    kind?: "cursor-agent" | "cursor-sdk" | "mock";
+    binPath?: string;
+    extraArgs?: string[];
+    // cursor-sdk only — the model id to pin (e.g. "composer-2"). Defaults
+    // to whatever the SDK picks. The API key itself is read from the
+    // CURSOR_API_KEY env var, never persisted in config.json.
+    model?: string;
+  };
 }
 
 const HOME = os.homedir();
 export const CONFIG_DIR = path.join(HOME, ".prepsavant");
 export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 export const SANDBOX_DIR = path.join(CONFIG_DIR, "sandbox");
+// Task #1211 — long-lived per-language build cache. Sandbox graders that
+// pay a heavy cold-start (dotnet restore+build, kotlinc -include-runtime)
+// reuse a stable directory keyed by harness-template version so the
+// .NET obj/bin and a precompiled Kotlin harness jar survive across
+// attempts. See sandbox/csharp.ts and sandbox/kotlin.ts.
+export const SANDBOX_CACHE_DIR = path.join(CONFIG_DIR, "sandbox-cache");
 // Local override for the runner's `research_jobs` target list. When this
 // file exists it takes precedence over the server-side saved list, so
 // power users can keep a per-machine "scan these companies" list without
@@ -40,6 +59,7 @@ export const DEFAULT_API_BASE =
 export function ensureConfigDir(): void {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.mkdirSync(SANDBOX_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(SANDBOX_CACHE_DIR, { recursive: true, mode: 0o700 });
 }
 
 export function readConfig(): RunnerConfig {
@@ -52,6 +72,7 @@ export function readConfig(): RunnerConfig {
       deviceId: parsed.deviceId,
       label: parsed.label,
       authorizedAt: parsed.authorizedAt,
+      ...(parsed.codingAgent ? { codingAgent: parsed.codingAgent } : {}),
     };
   } catch {
     return { apiBaseUrl: DEFAULT_API_BASE };

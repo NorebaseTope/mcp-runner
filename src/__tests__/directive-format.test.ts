@@ -1,5 +1,5 @@
 // Unit tests for the runner-side directive format and persona-cache constants.
-// Verifies that the JSON format emitted by practice_check_in / formatDirective
+// Verifies that the JSON format emitted by coached_check_in / formatDirective
 // is parseable and contains the required contract fields.
 
 import test from "node:test";
@@ -30,14 +30,14 @@ for (const action of EXPECTED_NON_QUIET_ACTIONS) {
 // Directive JSON roundtrip
 // ---------------------------------------------------------------------------
 
-// Simulate what practice_check_in serializes — strict verbatim pass-through.
-// samVoiceLine is passed as-is from the server directive (no fallback in this
-// path). Hosts may substitute their own phrasing when samVoiceLine is null.
+// Simulate what coached_check_in serializes — strict verbatim pass-through.
+// suggestedWording is passed as-is from the server directive (no fallback in this
+// path). Hosts may substitute their own phrasing when suggestedWording is null.
 function serializeDirective(d: CheckInDirective): string {
-  const samVoiceLine = d.samVoiceLine ?? null;
+  const suggestedWording = d.suggestedWording ?? null;
   const payload: Record<string, unknown> = {
     action: d.action,
-    samVoiceLine,
+    suggestedWording,
     reason: d.reason,
   };
   if (d.timeMilestone != null) {
@@ -49,14 +49,17 @@ function serializeDirective(d: CheckInDirective): string {
 test("directive JSON is parseable and has required fields — probe", () => {
   const d: CheckInDirective = {
     action: "probe",
-    samVoiceLine: "Walk me through the last thing you tried.",
+    intent: "probe to unblock the candidate",
+    constraints: [],
+    mustBeVerbatim: false,
+    suggestedWording: "Walk me through the last thing you tried.",
     reason: "idle for 7 min",
     timeMilestone: null,
   };
   const json = serializeDirective(d);
   const parsed = JSON.parse(json) as Record<string, unknown>;
   assert.equal(parsed["action"], "probe");
-  assert.equal(typeof parsed["samVoiceLine"], "string");
+  assert.equal(typeof parsed["suggestedWording"], "string");
   assert.equal(typeof parsed["reason"], "string");
   assert.ok(!("timeMilestone" in parsed), "timeMilestone must be omitted for probe");
 });
@@ -64,7 +67,10 @@ test("directive JSON is parseable and has required fields — probe", () => {
 test("directive JSON includes timeMilestone for time_warning", () => {
   const d: CheckInDirective = {
     action: "time_warning",
-    samVoiceLine: "Check your time.",
+    intent: "alert candidate about elapsed time",
+    constraints: [],
+    mustBeVerbatim: true,
+    suggestedWording: "Check your time.",
     reason: "session at 75% (warning)",
     timeMilestone: "warning",
   };
@@ -77,7 +83,10 @@ test("directive JSON includes timeMilestone for time_warning", () => {
 test("directive JSON includes timeMilestone=over_time for wrap_up", () => {
   const d: CheckInDirective = {
     action: "wrap_up",
-    samVoiceLine: "Time is up.",
+    intent: "wrap the session",
+    constraints: [],
+    mustBeVerbatim: true,
+    suggestedWording: "Time is up.",
     reason: "session at 100%",
     timeMilestone: "over_time",
   };
@@ -87,17 +96,20 @@ test("directive JSON includes timeMilestone=over_time for wrap_up", () => {
   assert.equal(parsed["timeMilestone"], "over_time");
 });
 
-test("practice_check_in verbatim pass-through for stay_quiet", () => {
+test("coached_check_in verbatim pass-through for stay_quiet", () => {
   const d: CheckInDirective = {
     action: "stay_quiet",
-    samVoiceLine: null,
+    intent: "say nothing",
+    constraints: [],
+    mustBeVerbatim: false,
+    suggestedWording: null,
     reason: "no action needed",
     timeMilestone: null,
   };
   const json = serializeDirective(d);
   const parsed = JSON.parse(json) as Record<string, unknown>;
   assert.equal(parsed["action"], "stay_quiet");
-  assert.equal(parsed["samVoiceLine"], null, "samVoiceLine must be null for stay_quiet");
+  assert.equal(parsed["suggestedWording"], null, "suggestedWording must be null for stay_quiet");
   assert.equal(typeof parsed["reason"], "string");
   assert.ok(!("timeMilestone" in parsed), "timeMilestone must be omitted when null");
 });
@@ -108,10 +120,10 @@ test("practice_check_in verbatim pass-through for stay_quiet", () => {
 
 function formatDirective(d: CheckInDirective | null | undefined): string {
   if (!d || d.action === "stay_quiet") return "";
-  const samVoiceLine = d.samVoiceLine ?? DIRECTIVE_FALLBACK[d.action];
+  const suggestedWording = d.suggestedWording ?? DIRECTIVE_FALLBACK[d.action];
   const payload: Record<string, unknown> = {
     action: d.action,
-    samVoiceLine,
+    suggestedWording,
     reason: d.reason,
   };
   if (d.timeMilestone != null) {
@@ -123,7 +135,10 @@ function formatDirective(d: CheckInDirective | null | undefined): string {
 test("formatDirective returns empty string for stay_quiet", () => {
   const result = formatDirective({
     action: "stay_quiet",
-    samVoiceLine: null,
+    intent: "say nothing",
+    constraints: [],
+    mustBeVerbatim: false,
+    suggestedWording: null,
     reason: "no action needed",
     timeMilestone: null,
   });
@@ -137,7 +152,10 @@ test("formatDirective returns empty string for null", () => {
 test("formatDirective emits nextAction JSON block for active directive", () => {
   const d: CheckInDirective = {
     action: "hint_offer",
-    samVoiceLine: "I have a hint ready.",
+    intent: "offer the next hint",
+    constraints: [],
+    mustBeVerbatim: false,
+    suggestedWording: "I have a hint ready.",
     reason: "3 consecutive failures",
     timeMilestone: null,
   };
@@ -146,14 +164,17 @@ test("formatDirective emits nextAction JSON block for active directive", () => {
   const jsonPart = result.replace("\nnextAction: ", "");
   const parsed = JSON.parse(jsonPart) as Record<string, unknown>;
   assert.equal(parsed["action"], "hint_offer");
-  assert.equal(parsed["samVoiceLine"], "I have a hint ready.");
+  assert.equal(parsed["suggestedWording"], "I have a hint ready.");
   assert.ok(!("timeMilestone" in parsed), "timeMilestone must be omitted when null");
 });
 
 test("formatDirective includes timeMilestone in JSON block for time_warning", () => {
   const d: CheckInDirective = {
     action: "time_warning",
-    samVoiceLine: "Check your time.",
+    intent: "alert candidate about elapsed time",
+    constraints: [],
+    mustBeVerbatim: true,
+    suggestedWording: "Check your time.",
     reason: "50%",
     timeMilestone: "midway",
   };
@@ -163,15 +184,18 @@ test("formatDirective includes timeMilestone in JSON block for time_warning", ()
   assert.equal(parsed["timeMilestone"], "midway");
 });
 
-test("formatDirective uses DIRECTIVE_FALLBACK when samVoiceLine is null", () => {
+test("formatDirective uses DIRECTIVE_FALLBACK when suggestedWording is null", () => {
   const d: CheckInDirective = {
     action: "probe",
-    samVoiceLine: null,
+    intent: "probe to unblock the candidate",
+    constraints: [],
+    mustBeVerbatim: false,
+    suggestedWording: null,
     reason: "idle",
     timeMilestone: null,
   };
   const result = formatDirective(d);
   const jsonPart = result.replace("\nnextAction: ", "");
   const parsed = JSON.parse(jsonPart) as Record<string, unknown>;
-  assert.equal(parsed["samVoiceLine"], DIRECTIVE_FALLBACK["probe"]);
+  assert.equal(parsed["suggestedWording"], DIRECTIVE_FALLBACK["probe"]);
 });

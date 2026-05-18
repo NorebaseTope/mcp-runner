@@ -1,10 +1,13 @@
-// MCP server registering practice_* and enrich_* tools. Runs on stdio by
-// default (`prepsavant mcp`). Tools call into the Sam HTTP API + the local
+// MCP server registering coached_*, ai_assisted_*, and enrich_* tools. Runs on stdio
+// by default (`prepsavant mcp`). Tools call into the Sam HTTP API + the local
 // sandbox; responses use MCP sampling for Sam's voice and fall back to the
-// server-side voice when sampling is unavailable.
+// server-side voice when sampling is unavailable. The legacy `practice_*` tool
+// aliases were removed in 0.5.0 — see the §coached.tool-aliases section in
+// `artifacts/sam/CONTRACTS.md` for the migration mapping.
 import { createHash } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { z } from "zod";
 import { SamApi } from "./api.js";
 import {
@@ -14,20 +17,12 @@ import {
   type LocalResearchTarget,
 } from "./config.js";
 import {
-  runJavascriptSandbox,
-  runTypescriptSandbox,
-  type SandboxResult,
-} from "./sandbox/node.js";
-import { runPythonSandbox } from "./sandbox/python.js";
-import {
   buildJobEnrichmentGrounding,
   buildJobResearchGrounding,
-  buildReviewGrounding,
-  inferCompanyPattern,
 } from "./persona.js";
-import { PersonaCache, DIRECTIVE_FALLBACK } from "./persona-cache.js";
-import type { CheckInDirective } from "./api.js";
+import { PersonaCache } from "./persona-cache.js";
 import { sampleSamVoice, tryExtractJson } from "./sampling.js";
+import { acquireRunnerLock } from "./runner-lock.js";
 import {
   startCoachedSession,
   getCoachedSession,
@@ -35,16 +30,48 @@ import {
   recordAiAssist,
   updateHintLevel,
 } from "./coached/session.js";
+import { bootCoachedCadenceLoop } from "./coached/cadence-boot.js";
 import {
   buildCheckInPayload,
+  buildCheckInPayloadFromResolved,
   isStallEscalation,
   resolveCoachedWorkDir,
+  resolveCheckInDirective,
+  shouldRefreshProgressForStall,
+  escalateForStall,
 } from "./coached/check-in.js";
+import {
+  computeProgressSignals,
+  type AttemptForSignals,
+} from "./coached/progress-signals.js";
+import {
+  BUNDLED_NUDGE_INSTRUCTION,
+  enrichDirectiveWithDiff,
+} from "./coached/diff-aware-nudge.js";
 import {
   buildCoachedPostMortemText,
   formatCoachedEndSessionResponse,
+  rewriteSessionMemoryWithDeps,
 } from "./coached/post-mortem.js";
-import { consumeStudyAskStream } from "./study/stream-consumer.js";
+import { ApiError } from "./api.js";
+// Task #1061 — AI-Assisted MCP tool family. The MCP host (Claude Desktop,
+// Cursor, Codex, etc.) IS the AI assistant in AI-Assisted mode, so the
+// tools are deliberately thin wrappers over the existing /runner/ai-sessions
+// API plus an opaque session-id handle. In-process Cursor hooks +
+// the per-event signing log were retired in @prepsavant/mcp@2.0.0
+// (Task #1193); end-of-session evidence now flows through the
+// Cursor-export upload path (`prepsavant upload-cursor-export`).
+import { generateEphemeralKeyPair, sha256Hex as aiSha256Hex } from "./ai-assisted/signing.js";
+// Task #1064 — verbatim relay protocol helpers + best-effort IDE rule install.
+import { wrapSamVerbatim } from "./sam-verbatim.js";
+import {
+  installAiAssistedIdeRulesBestEffort,
+  installIdeRulesBestEffort,
+} from "./skills/installer.js";
+// Task #1399 — shared CLI UI helpers for the polished AI-Assisted
+// startup banner returned by `ai_assisted_start_session`.
+import { makeColors } from "./cli-ui/index.js";
+import { renderAiAssistedStartupBanner } from "./cli-ui/ai-assisted-banner.js";
 
 // Surfaces the runner is allowed to push back into the dashboard's enrichment
 // cache. Mirrors the server-side TemplateSurface union — kept here as a
@@ -71,42 +98,78 @@ function asText(s: string) {
   return { content: [{ type: "text" as const, text: s }] };
 }
 
-// Append a machine-readable nextAction JSON block to tool response text.
-// Hosts MUST parse and honor the `action` field:
-//   - stay_quiet → do nothing proactive
-//   - all others → speak `samVoiceLine` verbatim on the next turn
-//   - For time_warning/wrap_up only speak once per `timeMilestone` value.
-// Returns "" when action is stay_quiet (nothing to append).
-function formatDirective(d: CheckInDirective | null | undefined): string {
-  if (!d || d.action === "stay_quiet") return "";
-  const samVoiceLine = d.samVoiceLine ?? DIRECTIVE_FALLBACK[d.action];
-  const payload = {
-    action: d.action,
-    samVoiceLine,
-    reason: d.reason,
-    ...(d.timeMilestone !== undefined && d.timeMilestone !== null
-      ? { timeMilestone: d.timeMilestone }
-      : {}),
-  };
-  return `\nnextAction: ${JSON.stringify(payload)}`;
+// Task #800 / #804 — best-effort end-of-session memory rewrite.
+//
+// Wires the runtime `SamApi` + MCP `Server` to the pure
+// `rewriteSessionMemoryWithDeps` helper in `coached/post-mortem.ts`.
+// All failure-mode behavior (host refusal, oversize, 413, generic
+// errors) lives in the helper and is unit-tested there. This wrapper
+// only handles the things that need live runtime objects: fetching the
+// candidate profile (404 → no-op so a brand-new candidate doesn't
+// trigger a rewrite), and translating between the helper's
+// `{sample, patch}` deps and `sampleSamVoice` / `SamApi.updateSessionMemory`.
+async function rewriteSessionMemoryBestEffort(deps: {
+  api: SamApi;
+  server: import("@modelcontextprotocol/sdk/server/index.js").Server;
+  questionTitle: string;
+  attemptsTotal: number;
+  hintsUsed: number;
+  passedLatest: boolean | undefined;
+  aiAssistDetected: boolean;
+}): Promise<void> {
+  let priorMemory = "";
+  try {
+    const profile = await deps.api.getCandidateProfile();
+    if (!profile) return;
+    priorMemory = profile.sessionMemory ?? "";
+  } catch (err) {
+    process.stderr.write(
+      `[coached_end_session] session memory rewrite skipped: getCandidateProfile failed (${err instanceof Error ? err.message : String(err)})\n`,
+    );
+    return;
+  }
+
+  await rewriteSessionMemoryWithDeps(
+    {
+      priorMemory,
+      questionTitle: deps.questionTitle,
+      attemptsTotal: deps.attemptsTotal,
+      hintsUsed: deps.hintsUsed,
+      passedLatest: deps.passedLatest,
+      aiAssistDetected: deps.aiAssistDetected,
+    },
+    {
+      sample: ({ systemPrompt, userPrompt }) =>
+        sampleSamVoice(deps.server, systemPrompt, userPrompt, priorMemory),
+      patch: (sessionMemory) =>
+        deps.api.updateSessionMemory({ sessionMemory }),
+    },
+  );
 }
 
-function summariseSandbox(r: SandboxResult): string {
-  const passed = r.cases.filter((c) => c.passed).length;
-  const failed = r.cases.length - passed;
-  return `${r.outcome.toUpperCase()} • ${passed} passed, ${failed} failed • ${r.runtimeVersion} • ${r.durationMs}ms`;
+// Task #1149 — `runMcpServer` accepts optional dependency overrides so an
+// in-memory MCP client can drive the server end-to-end (stub `SamApi` +
+// `InMemoryTransport`) and assert that `tools/list_changed` notifications
+// + the `tools/list` palette actually flip in step with the server's
+// per-session `availableTools[]`. Production callers pass nothing and
+// keep the previous stdio + real-API behaviour. When `transport` is
+// supplied we also skip the pid lockfile + the "listening on stdio"
+// stderr line so tests don't pollute the user's `~/.prepsavant`.
+export interface RunMcpServerOptions {
+  api?: SamApi;
+  transport?: Transport;
 }
 
-export async function runMcpServer(): Promise<void> {
+export async function runMcpServer(opts: RunMcpServerOptions = {}): Promise<void> {
   const cfg = readConfig();
-  if (!cfg.token) {
+  if (!cfg.token && !opts.api) {
     // We still start the server so the host can introspect tools, but every
     // tool call surfaces a clear error pointing at `prepsavant auth`.
     process.stderr.write(
       "[prepsavant] No device token. Run `prepsavant auth` to authorize.\n",
     );
   }
-  const api = new SamApi(cfg);
+  const api = opts.api ?? new SamApi(cfg);
   const persona = new PersonaCache(api);
   // Best-effort warmup so the first tool call already has the live persona
   // composed from the server. Failure here is non-fatal; PersonaCache will
@@ -158,276 +221,154 @@ export async function runMcpServer(): Promise<void> {
 
   const server = new McpServer(
     { name: "sam", version: ADAPTER_VERSION },
-    { capabilities: { tools: {} } },
-  );
-
-  // ---------------------------------------------------------------------
-  // practice_list_questions
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_list_questions",
     {
-      description: "List interview-prep questions available for practice.",
-      inputSchema: {},
-    },
-    async () => {
-      const list = await api.listQuestions();
-      const lines = list.items.map(
-        (q) =>
-          `${q.id}\t${q.title} [${q.roleFamily}/${q.difficulty}] (${q.languages.join(", ")})`,
-      );
-      return asText(lines.join("\n") || "No questions available.");
-    },
-  );
-
-  // ---------------------------------------------------------------------
-  // practice_start_session
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_start_session",
-    {
-      description:
-        "DEPRECATED — use coached_start_session instead. Start a new practice session for a given question. Returns the session id and the kickoff brief.",
-      inputSchema: {
-        questionId: z.string(),
-        companyId: z.string().optional(),
-        targetDurationMinutes: z.number().int().min(5).max(180).optional(),
-      },
-    },
-    async (args) => {
-      const start = await api.startSession({
-        questionId: args.questionId,
-        companyId: args.companyId,
-        targetDurationMinutes: args.targetDurationMinutes,
-      });
-      const detail = (await api.getSession(start.sessionId)) as {
-        kickoffBriefVerbatim?: string;
-      };
-      return asText(
-        [
-          `session_id: ${start.sessionId}`,
-          "",
-          detail.kickoffBriefVerbatim ?? "(no kickoff brief)",
-        ].join("\n"),
-      );
+      capabilities: { tools: {} },
+      // Task #1064 — verbatim-relay protocol. The MCP `instructions`
+      // field is surfaced to the host model on connect, so this is the
+      // earliest opportunity to tell it that during Coached sessions it
+      // is a transport for Sam's voice rather than the coach. The
+      // critical contract (sentinels, 90s cadence, lastAssistantTurn) is
+      // restated on every kickoff brief and every check-in directive,
+      // but stating it once up-front makes hosts that bind tools lazily
+      // (or skip the kickoff brief on resume) still see the rules.
+      instructions: [
+        "PrepSavant Sam — split-loop relay protocol (Task #1112 + #1194).",
+        "",
+        "During a Coached session you are Sam's relay agent — you carry Sam's intent to the candidate, in your own voice when allowed and word-for-word when required.",
+        "",
+        "1. Use the split-loop pair on every cadence beat: `coached_get_context` (read; cheap) BEFORE you author a turn, then `coached_record_turn` (write) immediately after you speak so the server can bucket your reply into the session's `directiveCompliance` rollup. The runner pushes proactive stall nudges + 50/75/90% time warnings out-of-band via MCP `notifications/message` — surface those when they arrive.",
+        "2. Each directive ships `intent`, `constraints`, `suggestedWording`, and `mustBeVerbatim`. Honour `intent` and every entry in `constraints` on every directive.",
+        "3. When `mustBeVerbatim:true`, `suggestedWording` is wrapped in `<<<SAM_VERBATIM>>> ... <<<END_SAM_VERBATIM>>>` sentinels — copy that block into your very next assistant turn byte-for-byte (sentinels included). Currently the verbatim allow-list is the safety/contract set: kickoff lines, the session contract, mode-framing, local-execution warning, `submit_pasted_code`, and `missed_heartbeat`.",
+        "4. When `mustBeVerbatim:false`, you MAY paraphrase `suggestedWording` to match your conversational tone, provided every `constraints` entry is preserved.",
+        "5. Never produce, edit, refactor, or paste the user's solution code in chat. Sam's persona forbids it.",
+        "6. Install the bundled IDE rule files (Cursor) when `coached_start_session` reports a successful install — they restate this protocol where the host can re-read it.",
+      ].join("\n"),
     },
   );
 
   // ---------------------------------------------------------------------
-  // practice_submit_attempt — runs the user's code in the local sandbox,
-  // pushes the graded attempt, asks the host model for Sam-voice review.
+  // Task #1144 — Dynamic per-session tool advertisement.
+  //
+  // The server publishes `availableTools[]` and bumps
+  // `capabilitySetVersion` on every `*_get_context` response. The runner
+  // mirrors that list onto its MCP tool palette so the host only sees
+  // the tools that are valid for the current phase (e.g. exactly one of
+  // `*_continue_practice` / `*_wrap_up_now` at any time, and the open-
+  // practice writes get pulled once an AI-Assisted session enters wrap
+  // up). The server-side 409 rejection path is kept as defence in depth.
+  //
+  // The runner serves a single MCP connection, so the advertised tool
+  // palette is connection-global and reflects the most recently
+  // refreshed session context per family. We keep one
+  // `{sessionId, version}` slot per family and re-apply whenever EITHER
+  // the active sessionId changes OR the server bumps
+  // `capabilitySetVersion`; back-to-back reads with the same tuple are
+  // a no-op so we don't spam `tools/list_changed`. Interleaving two
+  // live sessions of the same family on one runner is not a supported
+  // mode (one host, one chat) — the last `*_get_context` wins.
   // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_submit_attempt",
-    {
-      description:
-        "DEPRECATED — use practice_submit_attempt only for sessions started via practice_start_session. For new Coached sessions, submit attempts via your editor's run/test tools. Run the user's solution against the pinned tests in a local sandbox, push the graded attempt to Sam, and produce a Sam-voice review.",
-      inputSchema: {
-        sessionId: z.string(),
-        language: z.enum(["python", "javascript", "typescript"]),
-        code: z.string().min(1),
-      },
-    },
-    async (args) => {
-      // 1. Fetch the question + pinned tests for this session.
-      const session = (await api.getSession(args.sessionId)) as {
-        session: { questionId: string; companyName?: string };
-        question: { title: string };
-        attempts: { id: string; attemptNumber: number }[];
-        hints: { level: number }[];
-      };
-      const question = await api.getQuestion(session.session.questionId);
-      const tests = question.tests[args.language];
-      if (!tests) {
-        return asText(
-          `No pinned tests for language "${args.language}" on this question.`,
-        );
-      }
-      const timeoutMs = tests.timeoutMs ?? 5_000;
+  type GatedFamily = "coached" | "ai_assisted";
+  const gatedTools: Record<GatedFamily, Map<string, RegisteredTool>> = {
+    coached: new Map(),
+    ai_assisted: new Map(),
+  };
+  const capabilityState: Record<
+    GatedFamily,
+    { sessionId: string | null; version: number }
+  > = {
+    coached: { sessionId: null, version: -1 },
+    ai_assisted: { sessionId: null, version: -1 },
+  };
 
-      // 2. Run sandbox.
-      const sandbox =
-        args.language === "python"
-          ? runPythonSandbox(args.code, tests.entry, tests.cases, timeoutMs)
-          : args.language === "typescript"
-            ? runTypescriptSandbox(args.code, tests.entry, tests.cases, timeoutMs)
-            : runJavascriptSandbox(args.code, tests.entry, tests.cases, timeoutMs);
+  function registerGated(
+    family: GatedFamily,
+    name: string,
+    tool: RegisteredTool,
+  ): RegisteredTool {
+    gatedTools[family].set(name, tool);
+    return tool;
+  }
 
-      const passed = sandbox.cases.filter((c) => c.passed).length;
-      const failed = sandbox.cases.length - passed;
-
-      // 3. Push attempt.
-      const pushed = await api.pushAttempt(args.sessionId, {
-        language: args.language,
-        code: args.code,
-        outcome: sandbox.outcome,
-        timedOut: sandbox.timedOut,
-        durationMs: sandbox.durationMs,
-        adapterVersion: ADAPTER_VERSION,
-        runtimeVersion: sandbox.runtimeVersion,
-        cases: sandbox.cases.map((c) => ({
-          id: c.id,
-          // Server's RunnerPushAttemptBody requires a `status` enum, not a
-          // boolean. We coarsen booleans to "pass" / "fail" — sandbox runners
-          // surface timeouts via the top-level `outcome`/`timedOut` already.
-          status: c.passed ? ("pass" as const) : ("fail" as const),
-          durationMs: c.durationMs,
-          stderrExcerpt: c.stderrExcerpt,
-        })),
-      });
-
-      // 4. Ask the host model for review/probe in Sam's voice.
-      // Infer company pattern from the company name so Sam frames feedback
-      // against what this company actually tests, not a generic root cause.
-      const companyPattern = session.session.companyName
-        ? inferCompanyPattern(session.session.companyName)
-        : "generic";
-      const grounding = buildReviewGrounding({
-        questionTitle: question.question.title,
-        language: args.language,
-        outcome: sandbox.outcome,
-        passedCount: passed,
-        failedCount: failed,
-        failedCases: sandbox.cases
-          .filter((c) => !c.passed)
-          .map((c) => ({ id: c.id, stderrExcerpt: c.stderrExcerpt })),
-        attemptNumber: (session.attempts[session.attempts.length - 1]?.attemptNumber ?? 0) + 1,
-        hintsTaken: session.hints.length,
-        companyPattern,
-      });
-      const fallbackText = `${pushed.reviewVerbatim}\n\n${pushed.probeVerbatim}`;
-      const sampling = await sampleSamVoice(
-        server.server,
-        await samplingSystemPrompt(),
-        grounding,
-        fallbackText,
-      );
-
-      let reviewText = pushed.reviewVerbatim;
-      let probeText: string | undefined = pushed.probeVerbatim;
-      let source: "runner_sampling" | "runner_fallback" = "runner_fallback";
-      if (sampling.source === "runner_sampling") {
-        const parsed = tryExtractJson<{ review?: string; probe?: string }>(
-          sampling.text,
-        );
-        if (parsed?.review) {
-          reviewText = parsed.review;
-          probeText = parsed.probe;
-          source = "runner_sampling";
-        } else {
-          reviewText = sampling.text;
-          source = "runner_sampling";
+  function applyAvailableTools(
+    family: GatedFamily,
+    sessionId: string,
+    availableTools: ReadonlyArray<string>,
+    capabilitySetVersion: number,
+  ): void {
+    const state = capabilityState[family];
+    // Re-apply if the session changed OR the version bumped.
+    if (
+      state.sessionId === sessionId &&
+      state.version === capabilitySetVersion
+    ) {
+      return;
+    }
+    const allowed = new Set(availableTools);
+    for (const [name, tool] of gatedTools[family]) {
+      const wantEnabled = allowed.has(name);
+      if (wantEnabled && !tool.enabled) {
+        try {
+          tool.enable();
+        } catch (err) {
+          process.stderr.write(
+            `[prepsavant] failed to enable ${name}: ${err instanceof Error ? err.message : String(err)}\n`,
+          );
+        }
+      } else if (!wantEnabled && tool.enabled) {
+        try {
+          tool.disable();
+        } catch (err) {
+          process.stderr.write(
+            `[prepsavant] failed to disable ${name}: ${err instanceof Error ? err.message : String(err)}\n`,
+          );
         }
       }
+    }
+    state.sessionId = sessionId;
+    state.version = capabilitySetVersion;
+  }
 
-      // 5. Push the final review back so the dashboard can render it.
-      try {
-        await api.pushReview(args.sessionId, {
-          attemptId: pushed.attempt.id,
-          reviewText,
-          probeText,
-          source,
-        });
-      } catch {
-        // Non-fatal: the attempt is already saved with the server-side fallback.
+  function resetGatedTools(family: GatedFamily): void {
+    for (const [, tool] of gatedTools[family]) {
+      if (!tool.enabled) {
+        try {
+          tool.enable();
+        } catch {
+          // best effort
+        }
       }
-
-      // 6. Mirror the same review into the new surface×subject enrichment
-      //    cache so the session-review surface on the dashboard renders the
-      //    "Generated locally by Sam in your IDE" badge instead of the
-      //    static template fallback. We only push when sampling actually
-      //    succeeded — the server-side fallback is identical to what the
-      //    template would render anyway.
-      if (source === "runner_sampling") {
-        const composed = probeText
-          ? `${reviewText}\n\n${probeText}`
-          : reviewText;
-        await pushEnrichmentBestEffort({
-          surface: "session_review",
-          subject: args.sessionId,
-          body: composed,
-        });
-      }
-
-      return asText(
-        [
-          summariseSandbox(sandbox),
-          "",
-          reviewText,
-          probeText ? `\n${probeText}` : "",
-          formatDirective(pushed.nextAction),
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      );
-    },
-  );
+    }
+    capabilityState[family] = { sessionId: null, version: -1 };
+  }
 
   // ---------------------------------------------------------------------
-  // practice_request_hint
+  // Legacy `practice_*` tool aliases were REMOVED in 0.5.0. The canonical
+  // Coached tools below replace them 1:1 with the exception of submit:
+  //
+  //   practice_list_questions → coached_pick_question
+  //   practice_start_session  → coached_start_session
+  //   practice_request_hint   → coached_ask
+  //   practice_check_in       → coached_check_in
+  //   practice_end_session    → coached_end_session
+  //   practice_submit_attempt → (no equivalent — Coached sessions submit via
+  //                              the host editor's run/test tools)
+  //
+  // Hosts pinned to the old names will see "tool not found" until they
+  // migrate to the `coached_*` names. See the §coached.tool-aliases
+  // section of `artifacts/sam/CONTRACTS.md` for the rollout history.
+  //
+  // Task #794 note: the roleFamily / language / topic / difficulty filter
+  // set originally added to `practice_list_questions` lives on inside
+  // `coached_pick_question` below, so the question-selection turn still
+  // honours candidate filters like "easy backend Python".
   // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_request_hint",
-    {
-      description: "DEPRECATED — use coached_ask for Coached sessions. Ask Sam for the next hint on the active session.",
-      inputSchema: { sessionId: z.string() },
-    },
-    async (args) => {
-      const hint = await api.requestHint(args.sessionId);
-      const hintLine = hint.exhausted
-        ? `(no more hints — level ${hint.totalLevels} reached)`
-        : `Hint ${hint.level}/${hint.totalLevels}:\n${hint.hintText}`;
-      const directive = formatDirective(hint.nextAction);
-      return asText(directive ? `${hintLine}${directive}` : hintLine);
-    },
-  );
 
-  // ---------------------------------------------------------------------
-  // practice_check_in — host calls this after every message during a
-  // session (or on a ~3 min timer) to get the current directive. The
-  // host MUST speak samVoiceLine verbatim when action !== stay_quiet.
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_check_in",
-    {
-      description:
-        "DEPRECATED — use coached_check_in for new Coached sessions. Check in with Sam during an active practice session. Returns a directive: stay_quiet (do nothing), probe (surface the samVoiceLine to the user verbatim), hint_offer (tell the user a hint is available), time_warning, or wrap_up.",
-      inputSchema: { sessionId: z.string() },
-    },
-    async (args) => {
-      const directive = await api.checkIn(args.sessionId);
-      // Always return the full directive verbatim as JSON — strict pass-through
-      // so hosts have a stable, typed contract regardless of action.
-      // When action=stay_quiet the host must do nothing proactive.
-      // samVoiceLine is passed as-is from the server; hosts may fall back to
-      // their own phrasing if null, but the runner does not substitute here.
-      const samVoiceLine = directive.samVoiceLine ?? null;
-      const payload: Record<string, unknown> = {
-        action: directive.action,
-        samVoiceLine,
-        reason: directive.reason,
-      };
-      if ("timeMilestone" in directive && directive.timeMilestone != null) {
-        payload["timeMilestone"] = directive.timeMilestone;
-      }
-      return asText(JSON.stringify(payload));
-    },
-  );
-
-  // ---------------------------------------------------------------------
-  // practice_end_session
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "practice_end_session",
-    {
-      description: "DEPRECATED — use coached_end_session for new Coached sessions. End the active practice session.",
-      inputSchema: { sessionId: z.string() },
-    },
-    async (args) => {
-      await api.endSession(args.sessionId);
-      return asText("Session ended.");
-    },
-  );
+  // The pushAttempt grading path (sandbox + review/probe sampling) used to be
+  // exposed as `practice_submit_attempt`. It is intentionally NOT re-registered
+  // under a `coached_*` name — Coached submission rides on the host editor's
+  // own run/test tools. The grading code paths (`api.pushAttempt`,
+  // `buildReviewGrounding`, `pushEnrichmentBestEffort`) remain available for
+  // any future caller that wants to reintroduce a runner-driven submit flow.
 
   // =====================================================================
   // COACHED MODE TOOLS
@@ -446,7 +387,7 @@ export async function runMcpServer(): Promise<void> {
     "coached_pick_question",
     {
       description:
-        "List interview-prep questions available for a Coached session, optionally filtered by role family, difficulty, or language. Returns questions the user can pick from to start a Coached session via coached_start_session.",
+        "List interview-prep questions available for a Coached session, optionally filtered by role family, difficulty, language, topic, or company. The host MUST NOT infer or pre-select a question from the user's currently open file, editor context, visible code, or any other editor signal — question selection is the API's job, not the host's. Always call this tool and pick from the returned list (or accept an explicit user request that names a question by id/title). The fact that the candidate has, say, `shortest_alternating_paths.py` open in the editor is NOT a signal about which problem they want to practice. Returns questions the user can pick from to start a Coached session via coached_start_session. To discover valid `company` values when the candidate names a target firm, call coached_list_companies first — this tool returns an EMPTY list (not a difficulty-only fallback) when no question is tagged to the named company, so you must NOT invent a match.",
       inputSchema: {
         roleFamily: z
           .enum(["swe", "data", "ml", "infra", "mobile", "security", "other"])
@@ -455,20 +396,35 @@ export async function runMcpServer(): Promise<void> {
         language: z
           .enum(["python", "javascript", "typescript"])
           .optional(),
+        topic: z.string().optional(),
+        // Task #1061 — accepts a company id, slug, or case-insensitive
+        // name. The API resolves it server-side against the canonical
+        // companies table; pass the user's literal phrasing
+        // ("Anthropic", "stripe", "co_xyz") rather than guessing a slug.
+        company: z.string().optional(),
       },
     },
     async (args) => {
-      const raw = await api.listQuestions();
-      const items = raw.items.filter((q) => {
-        if (args.roleFamily && q.roleFamily !== args.roleFamily) return false;
-        if (args.difficulty && (q as { difficulty?: string }).difficulty !== args.difficulty) return false;
-        if (args.language) {
-          const langs = q.languages ?? [];
-          if (!langs.includes(args.language)) return false;
-        }
-        return true;
+      const raw = await api.listQuestions({
+        roleFamily: args.roleFamily,
+        language: args.language,
+        difficulty: args.difficulty,
+        topic: args.topic,
+        company: args.company,
       });
+      const items = raw.items;
       if (items.length === 0) {
+        // Task #1061 — when the candidate explicitly named a company, the
+        // most likely cause of an empty result is an unknown / mistyped
+        // company (the server returns [] rather than silently dropping
+        // the filter). Direct the host to coached_list_companies before
+        // it offers to relax the filter so we don't lose the candidate's
+        // signal about the firm they're targeting.
+        if (args.company) {
+          return asText(
+            `No questions are tagged to company "${args.company}". Call coached_list_companies to see which companies have tagged questions, then retry with one of those id/slug/name values — do NOT silently drop the company filter or invent a different match.`,
+          );
+        }
         return asText(
           "No questions match those filters. Try removing one of the filters or ask with no filters to see all questions.",
         );
@@ -488,6 +444,104 @@ export async function runMcpServer(): Promise<void> {
   );
 
   // ---------------------------------------------------------------------
+  // coached_orient — mode-framing turn (Task #794). Returns the verbatim
+  // SAM_VOICE.coached_mode_framing line plus the three mode summaries so
+  // the host can either render them as prose or surface a picker. Hosts
+  // MUST call this and speak `samVoiceLine` verbatim before
+  // coached_start_session whenever the candidate's opener is generic
+  // ("I want to practice", "let's do a coding round").
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_orient",
+    {
+      description:
+        "Mode framing for the Coached cold-open. Returns the orient framing intent + constraints + suggested wording plus the three mode options (coached, study, ai_assisted). The host MUST call this before coached_start_session whenever the candidate's opener is generic and they have NOT named a mode. The host AUTHORS its own opener that satisfies the listed constraints — it does NOT have to relay the suggestedWording verbatim. Until the candidate has explicitly named both a mode AND a question, the host MUST NOT discuss, explain, preview, or coach on any problem, and MUST NOT use the user's currently open file, editor tabs, or any visible code as a hint about what the candidate wants to practice — open-file context is NOT a proxy for question selection.",
+      inputSchema: {},
+    },
+    async () => {
+      const orient = await api.coachedOrient();
+      // Task #1115 (Phase 4) — host-driven opener. The server's
+      // `framing` block carries the contractual intent + constraints
+      // only; `suggestedWording` is empty by design (no server-
+      // authored prose on the orient surface). The host authors the
+      // actual opener turn itself from `intent` + `constraints` +
+      // `modes[]`. The deprecated `samVoiceLine` field is no longer
+      // emitted by the server (≥1.2.0); the type is retained on the
+      // client one release for parse-back-compat with any cached
+      // response objects.
+      const framing = orient.framing ?? {
+        action: "coached_mode_framing",
+        intent:
+          "Welcome the candidate, name the three available modes, and ask which one they want.",
+        constraints: [
+          "Mention all three modes: coached, study, ai_assisted.",
+          "Keep the opener under three sentences.",
+          "Do not pre-pick a mode; let the candidate choose.",
+        ],
+        // Task #1115 (Phase 4) — no server-authored prose. The
+        // fallback below is only reached if the server omits the
+        // `framing` block entirely (impossible post-cutover with
+        // floor ≥1.2.0 + this runner version).
+        suggestedWording: "",
+        mustBeVerbatim: false,
+      };
+      const lines = [
+        `action: ${framing.action}`,
+        `mustBeVerbatim: ${framing.mustBeVerbatim ? "true" : "false"} — author your own opener that satisfies every constraint below. There is NO server-supplied wording for this surface; do not invent one or relay any cached value verbatim.`,
+        "",
+        "intent:",
+        `  ${framing.intent}`,
+        "",
+        "constraints:",
+        ...framing.constraints.map((c) => `  - ${c}`),
+        "",
+        "modes:",
+        // Task #1061 — surface the canonical `nextTool` slug for each mode
+        // so the host branches on the right tool family (coached_*,
+        // study_*, ai_assisted_*) instead of falling back to coached_*
+        // for every mode.
+        ...orient.modes.map(
+          (m) => `- ${m.slug} (next tool: ${m.nextTool}): ${m.oneLineSummary}`,
+        ),
+      ];
+      return asText(lines.join("\n"));
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // coached_list_companies — Task #1061. Companies that have at least one
+  // tagged question, so the host can convert "I want an Anthropic
+  // question" into a valid coached_pick_question company filter without
+  // guessing a slug or hallucinating a match.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "coached_list_companies",
+    {
+      description:
+        "List companies that have at least one tagged interview question. Use this to discover valid `company` values for coached_pick_question whenever the candidate names a target firm — DO NOT guess slugs. Returns rows of `id\\tname (slug) — N question(s)` sorted by question count. An empty result means no question is currently tagged to any company; surface that to the candidate rather than silently dropping the company filter.",
+      inputSchema: {},
+    },
+    async () => {
+      const { items } = await api.listCompanies();
+      if (items.length === 0) {
+        return asText(
+          "No companies have tagged questions yet. Drop the company filter and pick from the full bank, or tell the candidate the bank does not have a company-specific question right now.",
+        );
+      }
+      const lines = items.map(
+        (c) => `${c.id}\t${c.name} (${c.slug}) — ${c.questionCount} question(s)`,
+      );
+      return asText(
+        [
+          `Found ${items.length} compan${items.length === 1 ? "y" : "ies"} with tagged questions. Pass the id, slug, or name to coached_pick_question's \`company\` filter.`,
+          "",
+          ...lines,
+        ].join("\n"),
+      );
+    },
+  );
+
+  // ---------------------------------------------------------------------
   // coached_start_session — start a Coached session entirely from chat.
   // Delivers the question + brief into the AI chat so the user never has
   // to open the webapp. Optionally accepts workspaceDir to enable passive
@@ -497,7 +551,7 @@ export async function runMcpServer(): Promise<void> {
     "coached_start_session",
     {
       description:
-        "Start a new Coached session for a given question. Delivers the question prompt and session brief into chat. The host should follow the HOST INSTRUCTIONS in the response to drive coaching nudges. Pass workDir (absolute path to the project folder) to enable stall detection via file-system watching; defaults to the runner's current working directory when omitted. `workspaceDir` is accepted as a backward-compatible alias.",
+        "Start a new Coached session for a given question. Delivers the question prompt and session brief into chat. The host should follow the HOST INSTRUCTIONS in the response to drive coaching nudges. The host MUST NOT preview, discuss, summarize, or explain the question before calling this tool — the canonical question prompt is delivered by THIS tool's response, not by the host's own narration. The host MUST NOT derive `questionId` from the user's currently open file, editor tabs, or any visible code; `questionId` MUST come from a prior `coached_pick_question` call or from an explicit user request that names the question by id or title. After this tool returns is the only point at which file/editor context becomes relevant — and even then only via the runner's diff-aware nudge machinery, not via the host fabricating its own coaching from open files. Pass workDir (absolute path to the project folder) to enable stall detection via file-system watching; defaults to the runner's current working directory when omitted. `workspaceDir` is accepted as a backward-compatible alias.",
       inputSchema: {
         questionId: z.string(),
         companyId: z.string().optional(),
@@ -522,39 +576,72 @@ export async function runMcpServer(): Promise<void> {
       const questionTitle = detail.question?.title ?? "Interview question";
       const questionPrompt = detail.question?.prompt ?? "";
 
-      startCoachedSession({
+      const coachedState = startCoachedSession({
         sessionId: start.sessionId,
         questionId: args.questionId,
         questionTitle,
         questionPrompt,
         workspaceDir: resolveCoachedWorkDir(args),
+        ...(typeof args.targetDurationMinutes === "number"
+          ? { targetDurationMinutes: args.targetDurationMinutes }
+          : {}),
       });
 
-      const brief = [
-        `session_id: ${start.sessionId}`,
-        "",
-        `# ${questionTitle}`,
-        "",
-        questionPrompt,
-        "",
-        "---",
-        "",
-        "HOST INSTRUCTIONS (Coached mode — follow exactly):",
-        "1. Call coached_check_in after every user message and at least every 3 minutes.",
-        "2. coached_check_in returns a directive. When action is not \"stay_quiet\", speak samVoiceLine verbatim.",
-        "3. If YOU generate, edit, or refactor code for the user — not as a coaching nudge but as direct assistance — call coached_check_in with aiAssistDetected:true and a brief aiAssistSummary describing what you did. This is detection only; the session continues.",
-        "4. Do NOT give the user a direct solution unless they explicitly ask Sam to switch to explanation mode.",
-        "5. When the user ends the session or says they are done, call coached_end_session.",
-        args.targetDurationMinutes
-          ? `6. This is a timed session: ${args.targetDurationMinutes} minutes.`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
+      // Task #1169 (Cursor-first M4) — boot the per-session local
+      // cadence loop. This is the runner-as-system-of-record switch:
+      // proactive stall nudges + 50/75/90% time warnings now fire
+      // from a local timer, pushed to the host out-of-band via MCP
+      // server-initiated `notifications/message`. Task #1194 (M8
+      // runtime) retired the demoted `coached_check_in` queue
+      // drainer — Cursor surfaces MCP notifications natively, and
+      // Cursor is now the sole supported AI-Assisted host.
+      bootCoachedCadenceLoop(coachedState, { mcp: server });
+
+      // Task #1401 — IDE rule install is retired. The runner now owns
+      // the terminal and drives Sam directly; there's no MCP host that
+      // needs the relay-protocol prose written into `.cursor/rules/`.
+      // `installIdeRulesBestEffort` is preserved as a no-op for one
+      // release so any in-flight third-party caller doesn't ENOENT.
+
+      // Task #1401 — the kickoff brief is now consumed by the
+      // runner-driven terminal coach, which strips any legacy HOST
+      // INSTRUCTIONS prose before printing. We always prefer the
+      // canonical `kickoffBriefVerbatim` from the API (still authored
+      // there for the one-release grace window), and fall back to a
+      // minimal title + prompt block when the API omits it. The
+      // protocol framing the old fallback restated has been retired:
+      // there is no MCP-host driving Sam any more.
+      const verbatim = detail.kickoffBriefVerbatim?.trim();
+      const brief = verbatim
+        ? [`session_id: ${start.sessionId}`, "", verbatim].join("\n")
+        : [
+            `session_id: ${start.sessionId}`,
+            "",
+            `# ${questionTitle}`,
+            "",
+            questionPrompt,
+            "",
+            args.targetDurationMinutes
+              ? `Timed session: ${args.targetDurationMinutes} minutes.`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
 
       return asText(brief);
     },
   );
+
+  // ---------------------------------------------------------------------
+  // coached_check_in — RETIRED in @prepsavant/mcp@1.9.0 (Task #1194,
+  // Cursor-first M8 runtime). This tool was demoted to a no-op queue
+  // drainer in 1.5.0 (Task #1169) and is now removed entirely. Hosts
+  // must use the split-loop pair (coached_get_context +
+  // coached_record_turn) and surface runner-pushed MCP
+  // notifications/message for cadence. Pre-1.9.0 callers receive
+  // `426 runner_upgrade_required` from the server; the floor is
+  // raised in lockstep.
+  // ---------------------------------------------------------------------
 
   // ---------------------------------------------------------------------
   // coached_ask — clarifying questions about the problem, answered by Sam
@@ -605,51 +692,94 @@ export async function runMcpServer(): Promise<void> {
     },
   );
 
+  // Task #1401 — `coached_get_context` and `coached_record_turn` are
+  // no longer registered on the MCP tool palette. The runner-driven
+  // terminal coach (see `coached/terminal-coach.ts`) now owns the
+  // cadence loop and speaks Sam-tagged colored lines straight into
+  // the user's shell, so an MCP host has nothing to drive any more.
+  // The HTTP endpoints (`POST /runner/sessions/:id/coached/context`
+  // / `…/turns`) stay live for one release of grace so any in-flight
+  // session adopted by a pre-2.0.0 runner can still drain. Once the
+  // floor (`MIN_SUPPORTED_RUNNER_VERSION`) bakes in 2.0.0 and the
+  // audit-log tells us split-loop calls have stopped, we'll delete
+  // the HTTP routes too.
+
   // ---------------------------------------------------------------------
-  // coached_check_in — periodic heartbeat during a Coached session.
-  // Returns a directive telling the host whether to stay quiet, offer a
-  // hint, probe the user, or issue a time warning. Also accepts AI-assist
-  // reports from the host so the runner can accumulate and persist them.
+  // Task #1112 (Phase 3b) — capability-gated escape hatches.
+  //
+  // `coached_say_exactly(tokenId)` is the verbatim relay path. The host
+  // reads `verbatimTokens[]` on the matching `coached_get_context`
+  // response and expands one by passing back its `tokenId` (and SHOULD
+  // echo `contextSnapshotId` so a token minted against a stale snapshot
+  // is rejected with `rejectReason: "stale_context"`). The server
+  // returns `{ expanded, text }` — the host MUST relay `text`
+  // byte-for-byte as Sam's next assistant turn.
+  //
+  // `coached_continue_practice` and `coached_wrap_up_now` are mutually
+  // exclusive: the server advertises exactly one of them in
+  // `availableTools` based on whether the timed session has crossed
+  // its target duration (`wrapUpRequired`). Calls out of phase are
+  // rejected with 409.
   // ---------------------------------------------------------------------
   server.registerTool(
-    "coached_check_in",
+    "coached_say_exactly",
     {
       description:
-        "Check in with Sam during an active Coached session. Returns a directive: stay_quiet, probe, hint_offer, time_warning, or wrap_up. Call this after every user message and on a ~3 min heartbeat. If you (the host) generated or edited code on the user's behalf, set aiAssistDetected:true and describe what you did in aiAssistSummary.",
+        "Task #1112 (Phase 3b) — expand a server-minted verbatim token. Read `verbatimTokens[]` on the matching `coached_get_context` response, then call this with the chosen `tokenId` (and echo the same `contextSnapshotId` you read alongside it). On success returns `{ expanded: true, text }` — relay `text` byte-for-byte as Sam's next assistant turn. On rejection returns `{ expanded: false, rejectReason }` (`unknown_token` / `consumed` / `stale_context`); re-read context and retry with the freshest token.",
       inputSchema: {
         sessionId: z.string(),
-        aiAssistDetected: z.boolean().optional(),
-        aiAssistSummary: z.string().optional(),
+        tokenId: z.string(),
+        contextSnapshotId: z.string().optional(),
       },
     },
     async (args) => {
-      // Each call to coached_check_in with aiAssistDetected:true represents
-      // exactly one AI-assist event. We always post delta=1 so the server-side
-      // counter increments correctly regardless of how many prior events have
-      // been accumulated locally.
-      if (args.aiAssistDetected) {
-        recordAiAssist(args.sessionId, args.aiAssistSummary ?? "");
-        await api.pushCoachedAiAssist(args.sessionId, {
-          count: 1,
-          summary: args.aiAssistSummary,
-        }).catch(() => {});
-      }
-
-      const directive = await api.checkIn(args.sessionId);
-      const state = getCoachedSession(args.sessionId);
-      // Detect runner-driven stall escalation BEFORE building the payload
-      // (buildCheckInPayload returns the post-escalation directive). If the
-      // server said `stay_quiet` and we upgraded it because the user has
-      // stopped editing files, report a stall_nudge event back to the API
-      // so the post-mortem can surface how often Sam had to break the
-      // silence (Task #564). Best-effort — we never block the directive
-      // delivery on the network call.
-      if (isStallEscalation(directive, state)) {
-        await api.pushCoachedStallNudge(args.sessionId, { count: 1 }).catch(() => {});
-      }
-      const payload = buildCheckInPayload(directive, state);
-      return asText(JSON.stringify(payload));
+      const result = await api.coachedSayExactly(args.sessionId, {
+        tokenId: args.tokenId,
+        ...(args.contextSnapshotId !== undefined
+          ? { contextSnapshotId: args.contextSnapshotId }
+          : {}),
+      });
+      return asText(JSON.stringify(result));
     },
+  );
+
+  registerGated(
+    "coached",
+    "coached_continue_practice",
+    server.registerTool(
+      "coached_continue_practice",
+      {
+        description:
+          "Task #1112 (Phase 3b) — capability-gated still-in-practice acknowledgement. Available only when `coachedWrapUpRequired === false` on the latest `coached_get_context` response (the timed session has NOT yet crossed its target duration). Use this to assert open-practice phase before a long sequence of coaching turns. Calls out of phase return `{ ok: false, rejectReason: \"wrap_up_required\" }`.",
+        inputSchema: { sessionId: z.string() },
+      },
+      async (args) => {
+        const result = await api.coachedContinuePractice(args.sessionId);
+        return asText(JSON.stringify(result));
+      },
+    ),
+  );
+
+  registerGated(
+    "coached",
+    "coached_wrap_up_now",
+    server.registerTool(
+      "coached_wrap_up_now",
+      {
+        description:
+          "Task #1112 (Phase 3b) — capability-gated wrap-up. Available only when `coachedWrapUpRequired === true` on the latest `coached_get_context` response (the timed session has crossed its target duration). Optionally pass a host-authored closing `message`. Calls out of phase return `{ ok: false, rejectReason: \"not_in_wrap_up_phase\" }` — re-read context and continue practice instead.",
+        inputSchema: {
+          sessionId: z.string(),
+          message: z.string().optional(),
+        },
+      },
+      async (args) => {
+        const result = await api.coachedWrapUpNow(args.sessionId, {
+          ...(args.message !== undefined ? { message: args.message } : {}),
+        });
+        return asText(JSON.stringify(result));
+      },
+    ),
   );
 
   // ---------------------------------------------------------------------
@@ -666,13 +796,85 @@ export async function runMcpServer(): Promise<void> {
     },
     async (args) => {
       const state = endCoachedSession(args.sessionId);
+      // Task #1144 — re-enable phase-gated coached tools for the next
+      // session, so a fresh `coached_start_session` does not inherit the
+      // disabled state from a prior wrap-up.
+      resetGatedTools("coached");
 
       // End the session first so the server-side row reflects the final
       // status before we fetch detail. The detail call is the
       // authoritative source of truth for AI-assist counts (they're
       // posted via /coached-events from outside the runner's in-memory
       // state, e.g. by host-side hooks).
-      await api.endSession(args.sessionId).catch(() => {});
+      // Task #1169 (Cursor-first M4) — runner-authored rolling recap
+      // draft. Posted alongside the end-session call so the api-server
+      // has the local view (file-edit timeline, stall nudges,
+      // time-warning fires, AI-assist beats) without having to
+      // reconstruct it from forwarded events. Unknown fields are
+      // ignored server-side today; M5 wires them into the post-mortem
+      // surface. Empty / no-state ends fall back to the legacy POST
+      // shape.
+      const recapDraft = state
+        ? {
+            sessionId: args.sessionId,
+            startedAt: state.startedAt,
+            endedAt: Date.now(),
+            targetDurationMs: state.targetDurationMs,
+            aiAssistCount: state.aiAssistCount,
+            aiAssistSummaries: state.aiAssistSummaries,
+            hintLevelFired: state.hintLevelFired,
+            events: state.recapEvents,
+          }
+        : undefined;
+      await api
+        .endSession(args.sessionId, recapDraft ? { recapDraft } : undefined)
+        .catch(() => {});
+
+      // Task #1176 — best-effort Cursor export auto-upload. Failures
+      // are queued for retry on next runner start; the outcome is
+      // surfaced to the user via stderr alongside session-end output.
+      try {
+        const { autoUploadCursorExport } = await import(
+          "./cursor-export/upload.js"
+        );
+        const result = await autoUploadCursorExport({
+          api,
+          sessionId: args.sessionId,
+          ...(state?.workspaceDir
+            ? { workspaceDir: state.workspaceDir as string }
+            : {}),
+          source: "auto",
+        });
+        if (result.status === "uploaded") {
+          process.stderr.write(
+            `[cursor-export] uploaded ${result.sizeBytes ?? "?"} bytes from ${result.sourcePath}\n`,
+          );
+        } else if (result.status === "not_found") {
+          process.stderr.write(
+            `[cursor-export] could not locate a Cursor export — will retry on next runner start. Run \`prepsavant upload-cursor-export --session-id ${args.sessionId} --file <path>\` to upload manually.\n`,
+          );
+        } else {
+          process.stderr.write(
+            `[cursor-export] upload failed (${result.reason ?? "unknown"}) — queued for automatic retry on next runner start.\n`,
+          );
+        }
+      } catch (err) {
+        // Top-level failure (e.g. dynamic import error) — still surface
+        // it to the user so they know what happened.
+        process.stderr.write(
+          `[cursor-export] auto-upload errored: ${(err as Error).message} — queued for automatic retry on next runner start.\n`,
+        );
+        try {
+          const { enqueue } = await import("./cursor-export/pending-queue.js");
+          enqueue({
+            sessionId: args.sessionId,
+            filePath: null,
+            reason: `outer_error: ${(err as Error).message}`,
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
 
       let detail: {
         session?: {
@@ -682,8 +884,14 @@ export async function runMcpServer(): Promise<void> {
           coachedAiAssistDetected?: boolean;
           coachedAiAssistCount?: number;
           coachedStallNudgeCount?: number;
+          // Per-session chat-activity counters (Task #797). Used to
+          // pick the chat-reviewed vs abandoned recap branch and to
+          // populate the structured summary fields on
+          // CoachedEndSessionSummary.
+          practiceCheckInCount?: number;
+          pastedCodeOffers?: number;
         };
-        question?: { title?: string };
+        question?: { title?: string; reviewKind?: "tests" | "rubric" | null };
         attempts?: Array<{ outcome?: string }>;
         hints?: Array<unknown>;
       } = {};
@@ -708,6 +916,11 @@ export async function runMcpServer(): Promise<void> {
       const aiAssistSummaries = state?.aiAssistSummaries ?? [];
       const questionTitle =
         detail.question?.title ?? state?.questionTitle ?? "the problem";
+      // Task #1163 — let the post-mortem swap "hidden tests" → rubric
+      // wording when this question is graded by rubric instead of
+      // pinned tests. Falls through to undefined (and the helper's
+      // historic "tests" default) when the detail fetch failed.
+      const reviewKind = detail.question?.reviewKind ?? undefined;
       const attemptsTotal = detail.session?.attemptsTotal ?? detail.attempts?.length ?? 0;
       const hintsUsed = detail.session?.hintsUsed ?? detail.hints?.length ?? 0;
       const passedLatest = detail.session?.passedLatest;
@@ -715,9 +928,15 @@ export async function runMcpServer(): Promise<void> {
       // doesn't keep an in-memory accumulator. If the detail fetch failed,
       // fall back to 0 rather than fabricating a value.
       const stallNudgeCount = detail.session?.coachedStallNudgeCount ?? 0;
+      // Chat-activity counters (Task #797). Server-side only — used to
+      // pick the chat-reviewed vs abandoned recap branch when the
+      // candidate ended without ever submitting code through the runner.
+      const checkInCount = detail.session?.practiceCheckInCount ?? 0;
+      const pastedCodeOffers = detail.session?.pastedCodeOffers ?? 0;
 
       const postMortem = buildCoachedPostMortemText({
         questionTitle,
+        reviewKind,
         attemptsTotal,
         hintsUsed,
         passedLatest,
@@ -725,6 +944,43 @@ export async function runMcpServer(): Promise<void> {
         aiAssistCount,
         aiAssistSummaries,
         stallNudgeCount,
+        checkInCount,
+        pastedCodeOffers,
+        checkInDiffSummaries: state?.checkInDiffSummaries ?? [],
+      });
+
+      // Task #800 / #804 — auto-summarize the rolling session memory.
+      //
+      // We sample the host with the prior session memory + this
+      // session's outcome and ask it to rewrite the memory under the
+      // 2,000-character cap (preferring recent learnings, dropping
+      // oldest entries first when something must go). The rewritten
+      // body is then PATCHed back to /profile/session-memory.
+      //
+      // Failure modes — all best-effort, none of them block the
+      // post-mortem return (the host has already received the tool
+      // result by the time the rewrite runs):
+      //   - GET /profile 404 → no profile yet, skip the rewrite.
+      //   - host refused sampling → log to stderr, keep prior memory.
+      //   - host returned > cap → log to stderr, keep prior memory
+      //     (we deliberately do NOT trim — a half-cut bullet would
+      //     destroy more context than leaving the prior body alone).
+      //   - PATCH 413 (server cap) → log to stderr and skip.
+      //   - any other API error → log to stderr and skip.
+      //
+      // The rewrite uses `SESSION_MEMORY_REWRITE_INSTRUCTION` as the
+      // sampling system directive (NOT the live Sam-voice persona) so
+      // the host model knows the cap and the "drop oldest first" rule.
+      // The contract is unit-tested in
+      // `coached-session-memory-rewrite.test.ts` via injectable deps.
+      void rewriteSessionMemoryBestEffort({
+        api,
+        server: server.server,
+        questionTitle,
+        attemptsTotal,
+        hintsUsed,
+        passedLatest,
+        aiAssistDetected,
       });
 
       return asText(
@@ -734,340 +990,10 @@ export async function runMcpServer(): Promise<void> {
           coachedAiAssistDetected: aiAssistDetected,
           coachedAiAssistCount: aiAssistCount,
           coachedStallNudgeCount: stallNudgeCount,
+          coachedCheckInCount: checkInCount,
+          coachedPastedCodeOffers: pastedCodeOffers,
           postMortem,
         }),
-      );
-    },
-  );
-
-  // ---------------------------------------------------------------------
-  // Study mode tools (task-531)
-  //
-  // These tools let the host model run a teaching chat with Sam scoped to
-  // a single problem. Conversations are persisted into the existing
-  // study_conversations / study_conversation_messages tables — the same
-  // ones the dashboard's Study chat viewer reads from. Critically, the
-  // study path NEVER writes to sessions / attempts / hint_events: this is
-  // a learning surface only and must not inflate practice counters.
-  //
-  // Flow:
-  //   1) Host calls study_start with a questionId (optionally postSessionId
-  //      for a post-session reflection). Tool creates the conversation
-  //      server-side and returns a kickoff brief that includes the problem
-  //      prompt + the verbatim Sam study persona + handoff instructions
-  //      for the host model.
-  //   2) Host generates Sam's reply locally for each user turn, then
-  //      calls study_send_message with both the user message and Sam's
-  //      reply. The runner persists both turns.
-  //   3) Host can call study_get_history to read back the transcript.
-  // ---------------------------------------------------------------------
-
-  // Inline persona builder shared with the server-side cookie path so the
-  // host model receives the exact same study persona the webapp would use.
-  function buildStudyPersonaPrompt(args: {
-    question: {
-      id: string;
-      title: string;
-      prompt: string;
-      difficulty: string;
-      estimatedMinutes: number;
-    };
-    mode: "study" | "post_session";
-  }): string {
-    const { question, mode } = args;
-    const teachingRules = [
-      `You are Sam — a senior interview coach in teaching mode.`,
-      `The user is studying one problem and can ask anything about it.`,
-      ``,
-      `Tone:`,
-      `- Short paragraphs. Concrete examples. No emoji. No flattery.`,
-      ``,
-      `Teaching-mode rules:`,
-      `- Stay scoped to "${question.title}". Do not drift into general career advice or other problems.`,
-      `- Explain concepts, patterns, canonical approaches, and tradeoffs freely — this is NOT a proctored session.`,
-      `- Do not dump a full worked solution unprompted. If asked directly for a solution, give it.`,
-      `- Do not reveal hidden test cases verbatim. You may describe what kinds of inputs are covered.`,
-      `- If the user pastes code, read it and give specific feedback. Do not invent behavior the code doesn't have.`,
-      `- Prefer ending each reply with one focused question to guide the user's thinking.`,
-    ].join("\n");
-
-    const problemContext = [
-      ``,
-      `Current problem:`,
-      `Title: ${question.title}`,
-      `Difficulty: ${question.difficulty}`,
-      `Estimated time: ${question.estimatedMinutes} minutes`,
-      ``,
-      `Problem prompt:`,
-      question.prompt,
-    ].join("\n");
-
-    const modeNote =
-      mode === "post_session"
-        ? `\n\nThis is a post-session reflection. The user just finished a graded session on this problem. The opening message (already in the transcript) summarized that session. Continue from there.`
-        : ``;
-
-    return teachingRules + problemContext + modeNote;
-  }
-
-  server.registerTool(
-    "study_start",
-    {
-      description:
-        "Open a study (teaching) conversation with Sam scoped to one problem. Pass a questionId for a fresh study chat, or postSessionId (with the same questionId) for a post-session reflection. Returns a conversationId and the kickoff brief: persona/system rules + the problem prompt the host model should follow when replying as Sam. Study chats are persisted but never create graded sessions, attempts, or hints.",
-      inputSchema: {
-        questionId: z.string().min(1),
-        postSessionId: z.string().min(1).optional(),
-      },
-    },
-    async (args) => {
-      const mode: "study" | "post_session" = args.postSessionId
-        ? "post_session"
-        : "study";
-      let detail;
-      try {
-        detail = await api.createStudyConversation({
-          questionId: args.questionId,
-          mode,
-          ...(args.postSessionId ? { sessionId: args.postSessionId } : {}),
-        });
-      } catch (err) {
-        return asText(
-          `Could not open study conversation: ${(err as Error).message}`,
-        );
-      }
-      const personaPrompt = buildStudyPersonaPrompt({
-        question: detail.question,
-        mode: detail.mode,
-      });
-      const opener =
-        detail.messages.length > 0
-          ? `\n\nOpening message already in the transcript (Sam):\n${detail.messages[detail.messages.length - 1]!.body}`
-          : "";
-      const kickoffBrief = [
-        `conversation_id: ${detail.id}`,
-        `mode: ${detail.mode}`,
-        `question_id: ${detail.questionId}`,
-        ``,
-        `--- Study persona (only used if you fall back to study_send_message) ---`,
-        personaPrompt,
-        opener,
-        ``,
-        `--- Handoff to host ---`,
-        `Preferred: after each user turn, call study_ask with conversationId="${detail.id}" and userMessage=<the user's text>. The runner streams Sam's real reply from prepsavant.com (matching the web Sam) and persists both the user turn and Sam's full reply on the server. Show the returned text to the user verbatim.`,
-        `Fallback: if you cannot use study_ask, generate Sam's reply locally using the persona above and call study_send_message with the user message and your Sam reply so both turns are persisted.`,
-        `Do not mix the two for the same turn — that would double-persist the user message.`,
-        `Do not call study_start again for this question/session unless the user explicitly wants a new conversation.`,
-      ].join("\n");
-      return asText(kickoffBrief);
-    },
-  );
-
-  // ---------------------------------------------------------------------
-  // study_ask (task-555) — preferred path for IDE study turns.
-  //
-  // Streams Sam's reply from prepsavant.com so the IDE chat sees Sam's
-  // actual model output (matching the web Sam experience), not whatever
-  // the host AI would have improvised. The runner calls the streaming
-  // server endpoint, accumulates deltas, optionally forwards them to the
-  // host as `notifications/message` so progressive UIs can render them,
-  // and returns the full Sam reply as the tool's text result.
-  //
-  // The server persists BOTH the user message and Sam's full reply into
-  // study_conversation_messages, so the host MUST NOT also call
-  // study_send_message after study_ask — that would double-write the user
-  // turn. study_send_message remains for hosts that want to drive Sam
-  // entirely from the local model.
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "study_ask",
-    {
-      description:
-        "Ask Sam in an open study conversation and stream his real reply from prepsavant.com. Persists both the user turn and Sam's full generated reply into the conversation transcript on the server — DO NOT also call study_send_message for the same turn. Returns Sam's full reply text. The runner forwards streamed chunks as MCP notifications/message events so chat UIs that render them can show Sam's voice live as it lands.",
-      inputSchema: {
-        conversationId: z.string().min(1),
-        userMessage: z.string().min(1).max(8000),
-      },
-    },
-    async (args, extra) => {
-      // Best-effort notification helper. Silently ignore send failures —
-      // the typing indicator and live deltas are progressive niceties;
-      // the final tool text always carries the full reply.
-      const notify = async (data: Record<string, unknown>): Promise<void> => {
-        if (!extra?.sendNotification) return;
-        try {
-          await extra.sendNotification({
-            method: "notifications/message",
-            params: {
-              level: "info",
-              logger: "study_ask",
-              data: { conversationId: args.conversationId, ...data },
-            },
-          });
-        } catch {
-          /* noop */
-        }
-      };
-      let full = "";
-      let errored: string | null = null;
-      try {
-        const result = await consumeStudyAskStream(
-          api.streamStudyMessage(args.conversationId, {
-            body: args.userMessage,
-          }),
-          notify,
-        );
-        full = result.full;
-        errored = result.error;
-      } catch (err) {
-        errored = err instanceof Error ? err.message : String(err);
-      }
-
-      if (errored && !full) {
-        return asText(`Could not generate Sam's reply: ${errored}`);
-      }
-      if (errored) {
-        // Partial reply: return what we got with a footer so the host can
-        // see generation didn't finish cleanly.
-        return asText(`${full}\n\n(stream ended early: ${errored})`);
-      }
-      return asText(full);
-    },
-  );
-
-  // ---------------------------------------------------------------------
-  // study_retry (task-571) — recover when a previous study_ask was
-  // interrupted (model error or stream disconnect after the user turn
-  // landed on the server). Re-runs Sam against the trailing user turn
-  // already persisted in the conversation, so the user does not have to
-  // re-type their question and the transcript does not gain a duplicate
-  // user message.
-  // ---------------------------------------------------------------------
-  server.registerTool(
-    "study_retry",
-    {
-      description:
-        "Retry Sam's reply for the trailing (unanswered) user turn of a study conversation when a previous study_ask call returned an error or was interrupted mid-stream. Does NOT insert a new user message — the user's last question is already saved on the server. Returns Sam's full reply text. Refuses if the last message in the conversation is already from Sam (nothing to recover).",
-      inputSchema: {
-        conversationId: z.string().min(1),
-      },
-    },
-    async (args, extra) => {
-      let full = "";
-      let errored: string | null = null;
-      try {
-        for await (const evt of api.retryStudyMessage(args.conversationId)) {
-          if (evt.type === "delta") {
-            full += evt.text;
-            if (extra?.sendNotification) {
-              try {
-                await extra.sendNotification({
-                  method: "notifications/message",
-                  params: {
-                    level: "info",
-                    logger: "study_retry",
-                    data: {
-                      conversationId: args.conversationId,
-                      delta: evt.text,
-                    },
-                  },
-                });
-              } catch {
-                /* noop */
-              }
-            }
-          } else if (evt.type === "error") {
-            errored = evt.error;
-            break;
-          }
-        }
-      } catch (err) {
-        errored = err instanceof Error ? err.message : String(err);
-      }
-
-      if (errored && !full) {
-        return asText(`Could not retry Sam's reply: ${errored}`);
-      }
-      if (errored) {
-        return asText(`${full}\n\n(stream ended early: ${errored})`);
-      }
-      return asText(full);
-    },
-  );
-
-  server.registerTool(
-    "study_send_message",
-    {
-      description:
-        "Persist one turn of a study conversation when you (the host) have already generated Sam's reply locally. Prefer study_ask, which streams Sam's real reply from prepsavant.com. Use study_send_message only when the host model is intentionally driving Sam itself. Both messages are appended in order: user first, then sam. Returns the persisted message ids and createdAt timestamps.",
-      inputSchema: {
-        conversationId: z.string().min(1),
-        userMessage: z.string().min(1).max(8000),
-        samReply: z.string().min(1).max(8000),
-      },
-    },
-    async (args) => {
-      try {
-        const userMsg = await api.appendStudyMessage(args.conversationId, {
-          role: "user",
-          body: args.userMessage,
-        });
-        const samMsg = await api.appendStudyMessage(args.conversationId, {
-          role: "sam",
-          body: args.samReply,
-        });
-        return asText(
-          [
-            `conversation_id: ${args.conversationId}`,
-            `persisted: 2 messages`,
-            `user_message_id: ${userMsg.message.id} (${userMsg.message.createdAt})`,
-            `sam_message_id:  ${samMsg.message.id} (${samMsg.message.createdAt})`,
-          ].join("\n"),
-        );
-      } catch (err) {
-        return asText(
-          `Could not persist study turn: ${(err as Error).message}`,
-        );
-      }
-    },
-  );
-
-  server.registerTool(
-    "study_get_history",
-    {
-      description:
-        "Read back the full transcript of a study conversation: all user and Sam messages in chronological order, plus the problem context. Use this to refresh context after the host's chat scrollback has been truncated.",
-      inputSchema: {
-        conversationId: z.string().min(1),
-      },
-    },
-    async (args) => {
-      let detail;
-      try {
-        detail = await api.getStudyConversation(args.conversationId);
-      } catch (err) {
-        return asText(
-          `Could not load study conversation: ${(err as Error).message}`,
-        );
-      }
-      const transcript =
-        detail.messages.length === 0
-          ? "(no messages yet)"
-          : detail.messages
-              .map(
-                (m) =>
-                  `[${m.createdAt}] ${m.role === "sam" ? "Sam" : "User"}: ${m.body}`,
-              )
-              .join("\n\n");
-      return asText(
-        [
-          `conversation_id: ${detail.id}`,
-          `mode: ${detail.mode}`,
-          `question: ${detail.question.title} (${detail.question.id})`,
-          ``,
-          `--- Transcript (${detail.messages.length} messages) ---`,
-          transcript,
-        ].join("\n"),
       );
     },
   );
@@ -1537,10 +1463,542 @@ export async function runMcpServer(): Promise<void> {
     },
   );
 
-  await server.connect(new StdioServerTransport());
-  process.stderr.write(
-    `[prepsavant] sam MCP server v${ADAPTER_VERSION} listening on stdio\n`,
+  // =====================================================================
+  // AI-ASSISTED MODE TOOLS — Task #1061
+  // The MCP host (Cursor as of Task #1194) IS the AI in AI-Assisted
+  // mode. These tools let the host create a session, drive the
+  // split-loop coaching surface, and finalize the session so the
+  // dashboard can grade the Cursor chat export. They DELIBERATELY do
+  // not refuse to generate code — refusing here is the failure mode
+  // AI-Assisted grades the candidate on, not the host.
+  //
+  // Task #1193 (@prepsavant/mcp@2.0.0) physically retired the
+  // `ai_assisted_log_event` / `ai_assisted_snapshot` per-event ingest
+  // tools and the in-process Cursor hook capture path. End-of-session
+  // evidence now flows through `prepsavant upload-cursor-export`.
+  // =====================================================================
+
+  // Capability manifest — replaces the previous import from
+  // `./ai-assisted/session.js`, which was deleted alongside the
+  // in-process hook capture path in Task #1193.
+  function buildCapabilityManifest(tool: string): {
+    captures: string[];
+    notCaptures: string[];
+    toolLabel: string;
+    consentVersion: string;
+    confidenceCeiling: "high" | "medium" | "low";
+    osCaveats: string[];
+    toolStatus: "ga" | "beta";
+  } {
+    return {
+      captures: [
+        "Cursor chat export uploaded at end of session",
+        "Sam's split-loop coaching turns (context + feedback)",
+      ],
+      notCaptures: [
+        "Live in-process Cursor hook events (retired in 2.0.0)",
+      ],
+      toolLabel: tool === "cursor" ? "Cursor" : tool,
+      consentVersion: "2025-05",
+      confidenceCeiling: "medium",
+      osCaveats: [],
+      toolStatus: "beta",
+    };
+  }
+
+  type AiAssistedSessionState = {
+    sessionId: string;
+    runnerVersion: string;
+    adapterVersion: string;
+    tool: string;
+    // Task #1416 — set to `true` once the AI-Assisted standing-frame
+    // rule files have been written into the candidate's workspace
+    // (`.cursor/rules/prepsavant-ai-assisted.mdc`). The runner forwards
+    // this to the api-server on every `ai_assisted_get_context` call so
+    // the server can suppress the duplicated HOST INSTRUCTIONS prose
+    // from the `activeConstraints` payload.
+    frameInstalled: boolean;
+  };
+  const aiAssistedSessions = new Map<string, AiAssistedSessionState>();
+
+  server.registerTool(
+    "ai_assisted_start_session",
+    {
+      description:
+        "Start an AI-Assisted session. The candidate has chosen to let YOU (the AI host) drive the work. You DO NOT refuse to generate, edit, or run code — refusing is the exact failure AI-Assisted grades the candidate's prompting on, not the host's policy. Pick the questionId from coached_pick_question (use coached_list_companies first if the candidate named a company). Returns the session id, the verbatim question prompt, and HOST INSTRUCTIONS describing the split-loop coaching tools (ai_assisted_get_context / ai_assisted_record_feedback / ai_assisted_end_session). Per-event ingest tools (ai_assisted_log_event / ai_assisted_snapshot) and the in-process Cursor hook path were retired in @prepsavant/mcp@2.0.0; evidence is now graded from the Cursor chat export uploaded via `prepsavant upload-cursor-export` at end-of-session. Requires the candidate to be on the $299 plan; the server returns 403 entitlement_required otherwise.",
+      inputSchema: {
+        questionId: z.string(),
+        // Task #1194 (Cursor-first M8 runtime) — Cursor is the sole
+        // supported AI-Assisted host. The previous claude_code/codex
+        // tool labels were retired alongside the hook adapters; only
+        // "cursor" is accepted, and start defaults to "cursor".
+        tool: z.enum(["cursor"]).optional(),
+        toolVersion: z.string().optional(),
+        companyId: z.string().optional(),
+        targetDurationMinutes: z.number().int().min(5).max(180).optional(),
+        // Task #1119 (code-review #5) — optional workspace dir so the
+        // installer can write `.cursor/rules/prepsavant-ai-assisted.mdc`
+        // and the AI-Assisted SKILL.md / CLAUDE.md managed block into
+        // the candidate's project. Mirrors the coached_start_session
+        // shape so hosts that already pass workDir for coached can
+        // forward the same value here.
+        workDir: z.string().optional(),
+        workspaceDir: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const tool = args.tool ?? "cursor";
+      const toolVersion = args.toolVersion ?? "mcp-host";
+      const keyPair = generateEphemeralKeyPair();
+      const manifest = buildCapabilityManifest(tool);
+      const start = await api.startAiAssistedSession({
+        questionId: args.questionId,
+        companyId: args.companyId,
+        targetDurationMinutes: args.targetDurationMinutes,
+        aiAssisted: {
+          tool,
+          toolVersion,
+          adapterVersion: ADAPTER_VERSION,
+          runnerVersion: ADAPTER_VERSION,
+          runnerPublicKey: keyPair.publicKeyBase64Url,
+          capabilityManifest: manifest,
+        },
+      });
+
+      const sessionState: AiAssistedSessionState = {
+        sessionId: start.sessionId,
+        runnerVersion: ADAPTER_VERSION,
+        adapterVersion: ADAPTER_VERSION,
+        tool,
+        frameInstalled: false,
+      };
+      aiAssistedSessions.set(start.sessionId, sessionState);
+
+      // Task #1119 (code-review #5) / Task #1416 — best-effort install
+      // of the AI-Assisted IDE rule files (Cursor's
+      // `.cursor/rules/prepsavant-ai-assisted.mdc`, Claude Code's
+      // CLAUDE.md managed block, `.claude/skills/prepsavant-ai-assisted/
+      // SKILL.md`) so the host has the family-scoped standing frame
+      // available immediately after start. We awa it the install (with
+      // a short timeout fallback) so we know whether the rule file
+      // actually landed — if it did, the runner forwards
+      // `frameInstalled: true` on every `ai_assisted_get_context` call
+      // and the api-server suppresses the duplicated HOST INSTRUCTIONS
+      // guardrails from `activeConstraints` (Task #1413's safety net).
+      // Failures must not block AI-Assisted session start (the
+      // server-side hard-fail at session create is the source-of-truth
+      // invariant; the installer is a host-side convenience).
+      try {
+        const installRes = await installAiAssistedIdeRulesBestEffort(
+          resolveCoachedWorkDir(args),
+          api,
+        );
+        sessionState.frameInstalled = installRes.installed;
+      } catch {
+        // Already swallowed inside the helper, but defence-in-depth.
+        sessionState.frameInstalled = false;
+      }
+
+      let questionPrompt = "";
+      let questionTitle = "Interview question";
+      try {
+        const detail = (await api.getSession(start.sessionId)) as {
+          question?: { title?: string; prompt?: string };
+        };
+        questionTitle = detail.question?.title ?? questionTitle;
+        questionPrompt = detail.question?.prompt ?? "";
+      } catch {
+        // Best-effort — the start response already gave us the session id.
+      }
+
+      // Task #1399 — render the polished startup banner (success
+      // header / Next steps / quieted question brief / "session live"
+      // footer). The HOST INSTRUCTIONS prose that previously trailed
+      // this response is intentionally omitted from the user-facing
+      // text — the AI host still receives the protocol via two
+      // surviving channels:
+      //   1. The `.cursor/rules/prepsavant-ai-assisted.mdc` standing
+      //      frame installed by `installIdeRulesBestEffort` above
+      //      (the AI-Assisted SKILL.md / CLAUDE.md managed block).
+      //   2. The `activeConstraints` payload returned by every
+      //      `ai_assisted_get_context` call.
+      // MCP stdio is non-TTY so `makeColors` auto-disables ANSI here;
+      // a future surface that pipes this through a real terminal can
+      // pass its own stream and get color for free.
+      const colors = makeColors({ isTTY: false });
+      // Task #1499 — pull the "How this session works" guide from the
+      // SAM_VOICE registry so the Cursor-rendered banner mirrors the
+      // dashboard practice page (including the export-into-this-folder
+      // instruction). Best-effort — falls back to no guide section on
+      // older api-server replicas.
+      let instructionGuide: string | null = null;
+      try {
+        const voice = await api.getSamVoice("practice_ai_assisted_guide");
+        instructionGuide = voice?.text ?? null;
+      } catch {
+        instructionGuide = null;
+      }
+      return asText(
+        renderAiAssistedStartupBanner(
+          {
+            adapterVersion: ADAPTER_VERSION,
+            sessionId: start.sessionId,
+            questionTitle,
+            questionPrompt,
+            ...(args.targetDurationMinutes !== undefined
+              ? { targetDurationMinutes: args.targetDurationMinutes }
+              : {}),
+            instructionGuide,
+          },
+          colors,
+        ),
+      );
+    },
   );
+
+  // Task #1193 (@prepsavant/mcp@2.0.0) — `ai_assisted_log_event` and
+  // `ai_assisted_snapshot` were physically retired alongside the
+  // in-process Cursor hook capture path. The dashboard now grades the
+  // Cursor chat export uploaded via `prepsavant upload-cursor-export`.
+
+  // Task #1119 — `ai_assisted_check_in` retired in runner v1.0.0. Hosts
+  // must use the split-loop pair (`ai_assisted_get_context` +
+  // `ai_assisted_record_feedback`) below.
+
+  registerGated(
+    "ai_assisted",
+    "ai_assisted_get_context",
+    server.registerTool(
+      "ai_assisted_get_context",
+      {
+        description:
+          "Pure-read AI-Assisted context (Task #1117, Phase 3a). Returns `contextSnapshotId` plus an `evidence` payload (event-log slice, recent attempts/snapshots, last cropped diff snippet, attempts/distinct-failing tests in the recent window, time elapsed/remaining, recent assistant feedback, `priorFeedbackCorrection`) and the active `activeConstraints`. Read this BEFORE you author a feedback turn so you can ground your wording in the same evidence the server would have used. The host MUST echo `contextSnapshotId` on the matching `ai_assisted_record_feedback` write so the server can detect stale-context turns.",
+        inputSchema: {
+          sessionId: z.string(),
+        },
+      },
+      async (args) => {
+        const state = aiAssistedSessions.get(args.sessionId);
+        if (!state) {
+          return asText(
+            `Unknown AI-Assisted session: ${args.sessionId}. Call ai_assisted_start_session first.`,
+          );
+        }
+        try {
+          const ctx = await api.getAiAssistedContext(args.sessionId, {
+            frameInstalled: state.frameInstalled,
+          });
+          // Task #1144 — mirror the server's per-session capability
+          // set onto the runner's AI-Assisted tool palette so phase-
+          // gated tools (`*_continue_practice` / `*_wrap_up_now`,
+          // and the open-practice writes) appear/disappear in step
+          // with the server.
+          applyAvailableTools(
+            "ai_assisted",
+            args.sessionId,
+            ctx.availableTools,
+            ctx.capabilitySetVersion,
+          );
+          return asText(JSON.stringify(ctx));
+        } catch (err) {
+          return asText(
+            `ai_assisted_get_context failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+  );
+
+  registerGated(
+    "ai_assisted",
+    "ai_assisted_record_feedback",
+    server.registerTool(
+      "ai_assisted_record_feedback",
+      {
+        description:
+          "Pure-write AI-Assisted feedback turn (Task #1117, Phase 3a). Records the host-authored feedback line. Echo the `contextSnapshotId` you read from `ai_assisted_get_context` so the server can flag the turn `staleContext: true` if a new event or snapshot arrived between read and write. The server runs the directive-mode compliance classifier and stamps `priorFeedbackCorrection` on the next `ai_assisted_get_context`. `feedbackKind` is an optional classifier label (e.g. `feedback_offer`, `progress_ack`, `submission_review`).",
+        inputSchema: {
+          sessionId: z.string(),
+          feedbackText: z.string(),
+          feedbackKind: z.string().optional(),
+          contextSnapshotId: z.string().optional(),
+        },
+      },
+      async (args) => {
+        const state = aiAssistedSessions.get(args.sessionId);
+        if (!state) {
+          return asText(
+            `Unknown AI-Assisted session: ${args.sessionId}. Call ai_assisted_start_session first.`,
+          );
+        }
+        try {
+          const result = await api.recordAiAssistedFeedback(args.sessionId, {
+            feedbackText: args.feedbackText,
+            ...(args.feedbackKind ? { feedbackKind: args.feedbackKind } : {}),
+            ...(args.contextSnapshotId
+              ? { contextSnapshotId: args.contextSnapshotId }
+              : {}),
+          });
+          return asText(JSON.stringify(result));
+        } catch (err) {
+          return asText(
+            `ai_assisted_record_feedback failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+  );
+
+  // ---------------------------------------------------------------------
+  // Task #1118 (Phase 3b) — AI-Assisted capability-gated escape hatches.
+  // Mirror of the coached say-exactly / wrap-up-now / continue-practice
+  // tools (Task #1112) for AI-Assisted sessions.
+  // ---------------------------------------------------------------------
+  server.registerTool(
+    "ai_assisted_say_exactly",
+    {
+      description:
+        "Task #1118 (Phase 3b) — expand a server-minted verbatim token for an AI-Assisted session. Read `evidence.verbatimTokens[]` on the matching `ai_assisted_get_context` response, then call this with the chosen `tokenId` and echo the same `contextSnapshotId` you read alongside it. The `contextSnapshotId` is REQUIRED — the server uses it to enforce the \"fetch context, then say_exactly next with no intervening writes\" guarantee. On success returns `{ expanded: true, text }` — relay `text` byte-for-byte as Sam's next assistant turn. On rejection returns `{ expanded: false, rejectReason }` (`unknown_token` / `consumed` / `stale_context`); re-read context and retry with the freshest token.",
+      inputSchema: {
+        sessionId: z.string(),
+        tokenId: z.string(),
+        contextSnapshotId: z.string(),
+      },
+    },
+    async (args) => {
+      const state = aiAssistedSessions.get(args.sessionId);
+      if (!state) {
+        return asText(
+          `Unknown AI-Assisted session: ${args.sessionId}. Call ai_assisted_start_session first.`,
+        );
+      }
+      try {
+        const result = await api.aiAssistedSayExactly(args.sessionId, {
+          tokenId: args.tokenId,
+          contextSnapshotId: args.contextSnapshotId,
+        });
+        return asText(JSON.stringify(result));
+      } catch (err) {
+        return asText(
+          `ai_assisted_say_exactly failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+  );
+
+  registerGated(
+    "ai_assisted",
+    "ai_assisted_continue_practice",
+    server.registerTool(
+      "ai_assisted_continue_practice",
+      {
+        description:
+          "Task #1118 (Phase 3b) — capability-gated still-in-practice acknowledgement for an AI-Assisted session. Available only when `evidence.wrapUpRequired === false` on the latest `ai_assisted_get_context` response. Calls out of phase return `{ ok: false, rejectReason: \"wrap_up_required\" }`.",
+        inputSchema: { sessionId: z.string() },
+      },
+      async (args) => {
+        const state = aiAssistedSessions.get(args.sessionId);
+        if (!state) {
+          return asText(
+            `Unknown AI-Assisted session: ${args.sessionId}. Call ai_assisted_start_session first.`,
+          );
+        }
+        try {
+          const result = await api.aiAssistedContinuePractice(args.sessionId);
+          return asText(JSON.stringify(result));
+        } catch (err) {
+          return asText(
+            `ai_assisted_continue_practice failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+  );
+
+  registerGated(
+    "ai_assisted",
+    "ai_assisted_wrap_up_now",
+    server.registerTool(
+      "ai_assisted_wrap_up_now",
+      {
+        description:
+          "Task #1118 (Phase 3b) — capability-gated wrap-up for an AI-Assisted session. Available only when `evidence.wrapUpRequired === true` on the latest `ai_assisted_get_context` response. Optionally pass a host-authored closing `message`. Calls out of phase return `{ ok: false, rejectReason: \"not_in_wrap_up_phase\" }`.",
+        inputSchema: {
+          sessionId: z.string(),
+          message: z.string().optional(),
+        },
+      },
+      async (args) => {
+        const state = aiAssistedSessions.get(args.sessionId);
+        if (!state) {
+          return asText(
+            `Unknown AI-Assisted session: ${args.sessionId}. Call ai_assisted_start_session first.`,
+          );
+        }
+        try {
+          const result = await api.aiAssistedWrapUpNow(args.sessionId, {
+            ...(args.message !== undefined ? { message: args.message } : {}),
+          });
+          return asText(JSON.stringify(result));
+        } catch (err) {
+          return asText(
+            `ai_assisted_wrap_up_now failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      },
+    ),
+  );
+
+  server.registerTool(
+    "ai_assisted_end_session",
+    {
+      description:
+        "Finalize the active AI-Assisted session. Computes the bundle manifest (event_count, log_hash, snapshot_count, trust_gap_count) and uploads it so the dashboard can grade the run. Returns the integrityStatus reported by the server (`bundle_uploaded`, `bundle_log_hash_mismatch`, etc.) so the host can surface it to the candidate. Idempotent — calling twice on the same session returns the second server response without re-signing.",
+      inputSchema: {
+        sessionId: z.string(),
+      },
+    },
+    async (args) => {
+      const state = aiAssistedSessions.get(args.sessionId);
+      if (!state) {
+        return asText(
+          `Unknown AI-Assisted session: ${args.sessionId}. Either ai_assisted_start_session was never called or the runner restarted between start and end.`,
+        );
+      }
+      const endedAt = new Date().toISOString();
+      // Task #1193 — in-process hook capture + per-event signing log
+      // were retired in 2.0.0. The bundle manifest is now a session-end
+      // marker (zeros + canonical empty-log hash); the dashboard grades
+      // the Cursor chat export uploaded below instead.
+      const emptyHash = aiSha256Hex("");
+      try {
+        const result = await api.finalizeAiAssistedBundle(args.sessionId, {
+          session_id: args.sessionId,
+          event_count: 0,
+          final_event_hash: emptyHash,
+          log_hash: emptyHash,
+          snapshot_count: 0,
+          trust_gap_count: 0,
+          ended_at: endedAt,
+          runner_version: state.runnerVersion,
+          adapter_version: state.adapterVersion,
+        });
+        const endedState = state;
+        aiAssistedSessions.delete(args.sessionId);
+        // Task #1144 — re-enable phase-gated AI-Assisted tools so a
+        // fresh `ai_assisted_start_session` does not inherit the
+        // disabled state from a prior wrap-up.
+        resetGatedTools("ai_assisted");
+
+        // Task #1176 — Cursor export auto-upload for AI-Assisted runs.
+        // Same retry/queue/stderr semantics as the coached counterpart.
+        try {
+          const { autoUploadCursorExport } = await import(
+            "./cursor-export/upload.js"
+          );
+          void endedState;
+          const ce = await autoUploadCursorExport({
+            api,
+            sessionId: args.sessionId,
+            source: "auto",
+          });
+          if (ce.status === "uploaded") {
+            process.stderr.write(
+              `[cursor-export] uploaded ${ce.sizeBytes ?? "?"} bytes from ${ce.sourcePath}\n`,
+            );
+          } else if (ce.status === "not_found") {
+            process.stderr.write(
+              `[cursor-export] could not locate a Cursor export — will retry on next runner start. Run \`prepsavant upload-cursor-export --session-id ${args.sessionId} --file <path>\` to upload manually.\n`,
+            );
+          } else {
+            process.stderr.write(
+              `[cursor-export] upload failed (${ce.reason ?? "unknown"}) — queued for automatic retry on next runner start.\n`,
+            );
+          }
+        } catch (err) {
+          process.stderr.write(
+            `[cursor-export] auto-upload errored: ${(err as Error).message} — queued for automatic retry on next runner start.\n`,
+          );
+          try {
+            const { enqueue } = await import(
+              "./cursor-export/pending-queue.js"
+            );
+            enqueue({
+              sessionId: args.sessionId,
+              filePath: null,
+              reason: `outer_error: ${(err as Error).message}`,
+            });
+          } catch {
+            /* best-effort */
+          }
+        }
+
+        return asText(
+          [
+            `AI-Assisted session ended.`,
+            `integrity_status: ${result.integrityStatus}`,
+            `event_count: 0 (per-event capture retired in 2.0.0)`,
+            `snapshot_count: 0`,
+            `trust_gap_count: 0`,
+            `ended_at: ${endedAt}`,
+          ].join("\n"),
+        );
+      } catch (err) {
+        return asText(
+          `Could not finalize AI-Assisted bundle: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+  );
+
+  // task-827 — write a pid lockfile so `prepsavant install` knows a Sam
+  // runner is currently active and refuses to rewrite MCP host configs
+  // mid-session. The lock is best-effort: any failure (read-only home
+  // dir, permission error) must not prevent the runner from starting.
+  // The release callback is wired both for graceful shutdown signals and
+  // through `process.on("exit")` inside `acquireRunnerLock`.
+  // Skipped when an injected transport is supplied (test harness) so we
+  // don't touch the user's `~/.prepsavant` from a unit test.
+  if (!opts.transport) {
+    try {
+      const release = acquireRunnerLock();
+      const onSignal = (): void => {
+        release();
+        process.exit(0);
+      };
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
+    } catch (err) {
+      process.stderr.write(
+        `[prepsavant] could not write runner lockfile (continuing): ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+
+  await server.connect(opts.transport ?? new StdioServerTransport());
+  if (!opts.transport) {
+    process.stderr.write(
+      `[prepsavant] sam MCP server v${ADAPTER_VERSION} listening on stdio\n`,
+    );
+  }
+
+  // Task #1176 — drain pending Cursor-export uploads in the background
+  // so a slow retry never blocks MCP framing.
+  void (async (): Promise<void> => {
+    try {
+      const { retryPendingUploads } = await import(
+        "./cursor-export/upload.js"
+      );
+      const drain = await retryPendingUploads({ api });
+      if (drain.retried > 0) {
+        process.stderr.write(
+          `[cursor-export] retried ${drain.retried} pending upload(s); ${drain.succeeded} succeeded\n`,
+        );
+      }
+    } catch {
+      /* best-effort */
+    }
+  })();
 }
 
 // Targeted system prompt for the research extractor. We deliberately do NOT

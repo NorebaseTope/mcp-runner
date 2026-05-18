@@ -1,9 +1,11 @@
-// Bundle the runner with esbuild so the vendored `@workspace/*` modules
-// (sam-market-context-shared, ai-assisted-events, mcp-runner-version) get
-// inlined into the published tarball. Consumers install `@prepsavant/mcp`
-// from npm and never have a `@workspace/...` package available — bundling
-// is what lets the runner ship those internal helpers.
+// Bundle the runner with esbuild so workspace dependencies (e.g.
+// `@workspace/sam-market-context-shared`) get inlined into the published
+// tarball. Consumers install `@prepsavant/mcp` from npm and never have a
+// `@workspace/...` package available — bundling is what lets the runner
+// share source-of-truth data with the API server in this monorepo.
 //
+// We deliberately keep this script tiny: the runner has no native
+// dependencies, no Sentry/pino plugins, and no source-map upload step.
 // External runtime deps (the MCP SDK, zod) stay in package.json
 // `dependencies` so end users still install them via npm/pnpm.
 
@@ -18,18 +20,17 @@ const distDir = path.resolve(here, "dist");
 
 // Read `package.json.version` at build time and inject it into the bundle
 // as a `define` constant. This makes `package.json` the single source of
-// truth for the runner version: the release workflow's
-// `npm version --no-git-tag-version` bump flows through to the built
-// `--version` output without any manual edit to a `*.ts` source file.
-// The release smoke test (built `--version` vs `package.json.version`) is
-// then a real safety net for build regressions, not a tripwire on a
-// missed manual sync.
+// truth for the runner version: a `npm version --no-git-tag-version` bump
+// in the release workflow flows through to the built `--version` output
+// without any manual edit to a `*.ts` source file. The release smoke test
+// (built `--version` vs `package.json.version`) is then a real safety net
+// for `build.mjs` regressions, not a tripwire on a missed manual sync.
 const pkg = JSON.parse(
   readFileSync(path.resolve(here, "package.json"), "utf-8"),
 );
 if (typeof pkg.version !== "string" || pkg.version.length === 0) {
   throw new Error(
-    "package.json is missing a non-empty `version` field",
+    "packages/mcp-runner/package.json is missing a non-empty `version` field",
   );
 }
 
@@ -43,38 +44,23 @@ await build({
   target: "node18.18",
   outfile: path.join(distDir, "cli.js"),
   logLevel: "info",
-  // Mirror the tsconfig `paths` so esbuild can resolve the vendored modules
-  // when bundling. Without these aliases, esbuild would try to look up the
-  // `@workspace/*` specifiers in node_modules and fail.
-  alias: {
-    "@workspace/sam-market-context-shared": path.resolve(
-      here,
-      "vendor/sam-market-context-shared/index.ts",
-    ),
-    "@workspace/ai-assisted-events": path.resolve(
-      here,
-      "vendor/ai-assisted-events/index.ts",
-    ),
-    "@workspace/mcp-runner-version": path.resolve(
-      here,
-      "vendor/mcp-runner-version/index.ts",
-    ),
-    "@workspace/mcp-runner-version/compare": path.resolve(
-      here,
-      "vendor/mcp-runner-version/compare.ts",
-    ),
-  },
-  // Anything that must be resolved by Node at runtime out of the consumer's
-  // node_modules. These are declared as real `dependencies` in package.json.
+  // External: anything that must be resolved by Node at runtime out of the
+  // consumer's node_modules. These are declared as real `dependencies` in
+  // package.json so `npm install @prepsavant/mcp` pulls them down.
+  // Task #1562 — `@cursor/sdk` was removed (replaced by a pure-HTTP client
+  // in `coached/cursor-http-client.ts`) so it no longer appears here.
   external: ["@modelcontextprotocol/sdk", "zod"],
   // `__ADAPTER_VERSION__` is declared as a global in `src/version.ts`.
   // esbuild substitutes the bare identifier (and `typeof`-of-it) at bundle
   // time so the bundled `dist/cli.js` carries a literal version string and
-  // never reads `package.json` at runtime.
+  // never reads `package.json` at runtime. The unbundled tsx path reads
+  // `package.json` via a `typeof __ADAPTER_VERSION__ === "undefined"`
+  // fallback in `src/version.ts`.
   define: {
     __ADAPTER_VERSION__: JSON.stringify(pkg.version),
   },
   // esbuild already preserves the `#!/usr/bin/env node` shebang from the
-  // entry file's first line.
+  // entry file's first line, so no banner is needed. The output retains
+  // the shebang and is marked executable by `chmod` in the npm publish step.
   sourcemap: false,
 });
